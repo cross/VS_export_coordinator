@@ -1,13 +1,25 @@
 # v12 capture plans
 
-The original route workflow is still available without `--plan`. Its prefixes,
-progress files, and exports are not migrated or overwritten by v12 planning.
+The coordinator uses only a saved coastline capture plan. By default it loads
+`capture-plans/coastal-connection/plan.json` relative to the script, regardless
+of the current working directory. `--plan` selects a different saved plan.
+There is no centerline/corridor fallback or separate Y/Z prompt. The previous
+implementation remains available in Git history; its capture files are untouched.
 The v12 geometry is a local copy of the accepted
 [`coastline_route_v12.py`](../capture-plans/coastal-connection/coastline_route_v12.py),
 stored with the plan it defines. This is planning input, rather than a
 temporary utility program.
 Planning and auditing use only the Python standard library and issue no server
 commands. Execute a capture only with the coordinator's `--plan` option.
+
+`plan.json` is generated output, rather than a file users need to author by
+hand. The generator is [`v12_capture_plan.py`](../v12_capture_plan.py). Its
+small inputs are the shoreline definitions, Y bounds, section-size options,
+and optional height/lake supplements. It expands those inputs into the
+requested regions, export cuboids, names, embedded geometry, and hashes needed
+for repeatable collection and coverage auditing.
+
+For instructions, see [Generate or revise a plan](#generate-or-revise-a-plan).
 
 ## Prepared plans: Y=65–180
 
@@ -50,6 +62,15 @@ The plan fixes geometry, unit names, and requested Y bounds; it does not prompt
 for a different capture prefix or Y interval. Changing the tmux pane/player
 does not invalidate geometric progress. Changing the export directory for an
 existing progress record is rejected instead of overwriting that record.
+
+The collector has no `--prefix` or `--z-span` option. Make geometry, height,
+and section-size changes with `v12_capture_plan.py`, review the resulting plan,
+then run the collector against that saved specification. A missing or invalid
+plan stops collection instead of selecting a different region generator.
+
+By default, both export commands and teleport commands use `tmux` from `PATH`.
+Use `--tmux-binary /absolute/path/to/tmux` to override it. The chosen executable
+is retained through retries and subdivisions.
 
 Each plan uses its own hash-derived prefix, `<prefix>-progress.json`, command
 directory, and execution coverage checkpoint beside `plan.json`. Reports write
@@ -105,37 +126,195 @@ all missing terrain from intentionally omitted air. It also cannot establish a
 single simultaneous world snapshot across separate captures. The audit records
 these evidence limits rather than claiming stronger verification.
 
-## New plans and partition choices
+## Generate or revise a plan
 
-Y bounds are required independently of the fixed horizontal buffer:
+Run the examples from the repository root. A Python interpreter is sufficient;
+there are no third-party Python dependencies. The generator does not use tmux,
+contact the game, or send server commands.
+
+### Reproduce the current plan
+
+This is the tool and configuration used to generate the current 160-section
+plan. A fresh temporary output directory lets you inspect the result without
+changing the maintained plan:
 
 ```sh
-python3 v12_capture_plan.py create --ymin 65 --ymax 180
-python3 v12_capture_plan.py create --ymin 65 --ymax 180 --x-span 256 --z-span 25 --output /tmp/coastal-connection-revised.json
+plan_draft_dir=$(mktemp -d)
+python3 v12_capture_plan.py create \
+  --geometry capture-plans/coastal-connection/coastline_route_v12.py \
+  --ymin 65 --ymax 180 \
+  --x-span 450 --z-span 50 \
+  --output "$plan_draft_dir/plan.json"
 ```
 
-The default is broader 50-block Z bands split into widths of at most 450.
-Use `--x-span` and `--z-span` to reduce initial selections further if needed;
-each must be between 1 and 1023 and all units also obey the volume limit.
-Changing these settings creates a new plan hash/prefix. The default destination
-is always `capture-plans/coastal-connection/plan.json`. Git records revisions;
-the adjacent `CHANGELOG.md` describes why each revision changed. The smaller X cap
-changes the partition only: it retains exactly the same requested and exported
-footprints as the previous 88-unit plan. Optional `--geometry PATH` reads literal shore
-definitions without executing that Python file. `--output PATH` chooses the
-plan destination. Identical regeneration is allowed. For a changed revision,
-write a draft outside the tracked plan directory, review it, replace the current
-`plan.json`, regenerate its preview, update `CHANGELOG.md`, and commit the two
-files together. Retrieve earlier plan contents with:
+The command prints its output locations and writes `plan.json` and `plan.svg`
+in that temporary directory. With the current source and options, its content
+hash matches the committed 160-section plan. You can compare the complete JSON:
+
+```sh
+cmp "$plan_draft_dir/plan.json" capture-plans/coastal-connection/plan.json
+```
+
+`cmp` prints nothing and exits successfully when the files match.
+
+### Choose the change you need
+
+| Desired change | Inputs and command |
+| --- | --- |
+| Change the requested height for the entire footprint | `create --ymin MIN --ymax MAX` |
+| Use smaller or larger initial sections | `create --x-span WIDTH --z-span DEPTH` |
+| Change the shoreline shape within the existing v12 area | Edit a geometry-file copy and use `create --geometry FILE` |
+| Add height over selected regions while retaining existing export unit names | `extend --plan FILE --regions REGIONS.json` |
+| Include whole intersecting freshwater bodies | `create --freshwater BODIES.json`, or `extend --plan FILE --freshwater BODIES.json` |
+
+Every `create` command also requires `--ymin` and `--ymax`. Use `--output` to
+write a draft. `--x-span` defaults to 450 and `--z-span` to 50; these are maximum
+sizes, so edge sections can be smaller. Both must be integers from 1 to 1023,
+and the generator also enforces the selection-volume limit. Y bounds are
+inclusive: 65 through 180 is 116 blocks high.
+
+For example, generate smaller sections without changing the requested height:
+
+```sh
+plan_draft_dir=$(mktemp -d)
+python3 v12_capture_plan.py create \
+  --ymin 65 --ymax 180 \
+  --x-span 256 --z-span 25 \
+  --output "$plan_draft_dir/plan.json"
+```
+
+The geometry file defaults to the v12 shoreline source beside the maintained
+plan. Without `--output`, the destination is the maintained
+`capture-plans/coastal-connection/plan.json`. Both defaults are relative to the
+generator's location, regardless of cwd. Explicit relative paths are relative
+to cwd; use absolute paths when invoking the program from another directory.
+The generator allows identical regeneration but refuses to overwrite an
+existing plan with different contents. Use a fresh draft path for each variant.
+
+### Edit the shoreline geometry
+
+Start with a copy of the human-maintained source, not the generated JSON:
+
+```sh
+geometry_draft_dir=$(mktemp -d)
+cp capture-plans/coastal-connection/coastline_route_v12.py \
+  "$geometry_draft_dir/coastline.py"
+```
+
+Edit `coastline.py` in that directory. The two literal lists `WEST_SHORE` and
+`EAST_SHORE` describe paths in relative world X/Z block coordinates:
+
+| Operation | Format and meaning |
+| --- | --- |
+| `M` | One `(X, Z)` point: the start of the shore. Each path starts with one `M`. |
+| `L` | One `(X, Z)` point: a straight segment from the preceding endpoint. |
+| `C` | Three `(X, Z)` points: two control points and the endpoint of a cubic Bezier curve, starting from the preceding endpoint. |
+
+For example, this existing west-shore segment has two control points followed
+by its endpoint:
+
+```python
+('C', [(-33728, 61470), (-33678, 61503), (-33665, 61525)])
+```
+
+Use numeric literals, including decimals where needed. The loader reads these
+definitions as data and does not execute the Python file or evaluate imports,
+functions, or calculated expressions.
+
+Each segment must move forward in Z. Its control points must have
+nondecreasing Z values, and its endpoint must have a greater Z than its start.
+The west shore must cover Z=59750–62360 and the east shore Z=59375–61994. The
+generator rejects unsupported paths, missing row coverage, and reversed
+west/east capture boundaries. Regenerate after editing:
+
+```sh
+plan_draft_dir=$(mktemp -d)
+python3 v12_capture_plan.py create \
+  --geometry "$geometry_draft_dir/coastline.py" \
+  --ymin 65 --ymax 180 \
+  --x-span 450 --z-span 50 \
+  --output "$plan_draft_dir/plan.json"
+```
+
+This generator is currently specific to the v12 coastal connection. The Z
+bands, mouth anchors, 100-block buffer, coordinate offset, and v12 geometry
+label are fixed in the program; they have no CLI options. `--geometry` permits
+shore-shape revisions within those constraints. Planning a completely
+different world region or changing those rules requires modifying the planner.
+
+### Review and use a draft
+
+Open the emitted `plan.svg` in an image viewer or browser. It shows the
+required footprint and export mosaic. Generation also checks that export
+units do not overlap, obey size/volume limits, and cover every requested region.
+The printed summary gives section counts, maximum unit volume, and extra
+captured volume.
+
+You can explicitly preview the draft with the coordinator, without sending
+commands or changing the maintained plan:
+
+```sh
+python3 vintage_story_export_coordinator.py \
+  --plan "$plan_draft_dir/plan.json" --preview
+```
+
+For a deliberate server test of that draft, choose the pane and actual WorldEdit
+export directory, then run:
+
+```sh
+python3 vintage_story_export_coordinator.py \
+  --plan "$plan_draft_dir/plan.json" \
+  --target-pane PANE --export-dir EXPORT_DIRECTORY \
+  --step-by-step --verbose
+```
+
+That last command sends server commands after your confirmation. Progress and
+reports are written beside the selected draft, while world exports go in the
+configured export directory. Move a draft you intend to run into durable local
+storage first; a temporary directory is suitable for review, not long-term
+resume records.
+
+### Make a reviewed revision the maintained plan
+
+Retain a frozen plan copy with the progress records of any unfinished run
+before changing the maintained specification. Then promote the reviewed JSON:
+
+```sh
+cp "$plan_draft_dir/plan.json" capture-plans/coastal-connection/plan.json
+python3 vintage_story_export_coordinator.py --preview
+```
+
+If you edited the shoreline copy in the geometry example, also promote that
+reviewed source so future generation uses the same geometry:
+
+```sh
+cp "$geometry_draft_dir/coastline.py" \
+  capture-plans/coastal-connection/coastline_route_v12.py
+```
+
+Commit changed geometry or supplement input files along with the plan so the
+result can be reproduced. Update the adjacent
+`CHANGELOG.md` with what changed and why, then commit it together with
+`plan.json`. Earlier full plan contents belong in Git history:
 
 ```sh
 git log --oneline -- capture-plans/coastal-connection/plan.json
 git show COMMIT:capture-plans/coastal-connection/plan.json
 ```
 
-Keep a frozen copy of a plan needed by an unfinished run, alongside its
-progress records. Historical run records and world exports should be retained
-locally rather than exposed as extra maintained plan revisions.
+The preview command regenerates SVG only; a local PNG snapshot is not updated
+automatically. Regenerate or discard an outdated PNG after changing the plan.
+
+Do not hand-edit `requests`, `cuboids`, export names, or hash fields in the
+expanded JSON. Editing it invalidates its content hash; changing the input and
+regenerating keeps geometry, coverage, and identifiers consistent. `create`
+assigns a new set of export names when inputs change. Use `extend` for additive
+height/lake coverage when you want existing export unit names retained; it
+does not change the existing section sizes or remove requested coverage.
+
+Historical run records and world exports should be retained locally rather
+than exposed as extra maintained plan revisions. A plan file does not itself
+contain the collected terrain data.
 
 ## Additional height coverage
 

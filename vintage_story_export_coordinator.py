@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Interactively coordinate, monitor, and verify Vintage Story WorldEdit exports.
+# vim:et sts=4 sw=4
+"""Collect and verify Vintage Story WorldEdit exports from a saved coastline plan.
 
+The saved plan is the only source of selection bounds, heights, and export
+names. The default is capture-plans/coastal-connection/plan.json beside this
+script; v12_capture_plan.py creates and revises that specification.
 This program never edits terrain. It writes `/we select` and `/we export`
 commands to a file, pastes them to the confirmed tmux pane, then watches the
 chosen WorldEdit export directory for the resulting JSON file.
@@ -15,10 +19,8 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -28,14 +30,8 @@ from typing import Any
 import v12_capture_plan as capture_plan
 
 
-WORLD_CENTER = 512_000
-ROUTE_XZ = [(-34125, 59710), (-33952, 60548), (-33743, 60934), (-33012, 62110)]
-CHANNEL_MAX_WIDTH = 250
-CAPTURE_MARGIN = 100
-NORTH_EXTRA = 50
-DEFAULT_Y_BOUNDS = {"ymin": 80, "ymax": 160}
-DEFAULT_Z_SPAN = 50
-MAX_SELECTION_BLOCKS = 9_000_000
+WORLD_CENTER = capture_plan.WORLD_CENTER
+DEFAULT_PLAN = Path(__file__).resolve().parent / "capture-plans" / "coastal-connection" / "plan.json"
 DEFAULT_PLAYER = "Xplosionist"
 STABILITY_SECONDS = 2.0
 POLL_SECONDS = 0.5
@@ -53,7 +49,6 @@ class Cuboid:
     zmin: int
     zmax: int
     name: str
-    plan_mode: bool = False
 
     @property
     def size(self) -> tuple[int, int, int]:
@@ -74,46 +69,6 @@ def reported_export_size(path: Path) -> str:
         return f"{data.get('SizeX')}×{data.get('SizeY')}×{data.get('SizeZ')}"
     except (OSError, UnicodeError, json.JSONDecodeError):
         return "unknown dimensions"
-
-
-def route_center_x(z: float, path: list[tuple[int, int]]) -> float:
-    if z <= path[0][1]:
-        return float(path[0][0])
-    if z >= path[-1][1]:
-        return float(path[-1][0])
-    for (x0, z0), (x1, z1) in zip(path, path[1:]):
-        if z0 <= z <= z1:
-            t = (z - z0) / (z1 - z0)
-            return x0 + (x1 - x0) * t
-    raise ValueError(f"Could not interpolate route at Z={z}")
-
-
-def route_corridor_slices(ymin: int, ymax: int, z_span: int,
-                          prefix: str) -> tuple[list[Cuboid], dict[str, int]]:
-    """Create consecutive Z slices whose X bounds follow the buffered route."""
-    # Add the requested 50-block northern extension, then buffer the channel
-    # half-width plus the 100-block capture margin in X and Z.
-    path = [(-34125, 59710 - NORTH_EXTRA), *ROUTE_XZ]
-    radius = CHANNEL_MAX_WIDTH // 2 + CAPTURE_MARGIN
-    z_low = path[0][1] - radius
-    z_high = path[-1][1] + radius
-    result: list[Cuboid] = []
-    serial = 1
-    z0 = z_low
-    while z0 <= z_high:
-        z1 = min(z_high, z0 + z_span - 1)
-        centers = [route_center_x(float(z0), path), route_center_x(float(z1), path)]
-        centers.extend(float(x) for x, z in path if z0 <= z <= z1)
-        x0 = math.floor(min(centers) - radius)
-        x1 = math.ceil(max(centers) + radius)
-        name = f"{prefix}_{serial:04d}_x{x0}_{x1}_z{z0}_{z1}"
-        result.append(Cuboid(serial, x0, x1, ymin, ymax, z0, z1, name))
-        serial += 1
-        z0 = z1 + 1
-    bounds = {"xmin": min(c.xmin for c in result), "xmax": max(c.xmax for c in result),
-              "ymin": ymin, "ymax": ymax, "zmin": min(c.zmin for c in result),
-              "zmax": max(c.zmax for c in result)}
-    return result, bounds
 
 
 def expected_export(c: Cuboid) -> dict[str, Any]:
@@ -140,7 +95,7 @@ def split_largest_dimension(c: Cuboid, prefix: str) -> tuple[Cuboid, Cuboid]:
                 f"_z{child_starts[2]}_{child_ends[2]}")
         children.append(Cuboid(c.index, child_starts[0], child_ends[0],
                                child_starts[1], child_ends[1], child_starts[2],
-                               child_ends[2], name, c.plan_mode))
+                               child_ends[2], name))
     return children[0], children[1]
 
 
@@ -216,11 +171,10 @@ def merge_exports(parent: Cuboid, pieces: list[tuple[Cuboid, Path]], destination
     merged["SizeY"] = max(1, min(parent.size[1], max_y))
     merged["SizeZ"] = parent.size[2]
     merged["OriginalPos"] = parent_origin
-    if parent.plan_mode:
-        # Preserve leaf evidence inside generated merges, including when a new
-        # extension plan reuses the file without the old progress record.
-        merged["CapturePlanPieces"] = [{"file": path.name, **cuboid_record(piece)}
-                                       for piece, path in pieces]
+    # Preserve leaf evidence inside generated merges, including when a new
+    # extension plan reuses the file without the old progress record.
+    merged["CapturePlanPieces"] = [{"file": path.name, **cuboid_record(piece)}
+                                   for piece, path in pieces]
     tmp = destination.with_suffix(destination.suffix + ".tmp")
     tmp.write_text(json.dumps(merged, separators=(",", ":")), encoding="utf-8")
     tmp.replace(destination)
@@ -262,36 +216,13 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
     for key in ("DecorIndices", "DecorIds"):
         if key in data and not isinstance(data[key], list):
             problems.append(f"{key} is not an array")
-    if c.plan_mode:
-        problems.extend(capture_plan.inspect_export(path, cuboid_record(c))["problems"])
+    problems.extend(capture_plan.inspect_export(path, cuboid_record(c))["problems"])
     return problems
 
 
 def returned_export_bounds(path: Path, c: Cuboid) -> dict[str, int] | None:
-    """Return the nonempty X/Z envelope reported by an export, if trustworthy."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    origin = data.get("OriginalPos")
-    indices, block_ids = data.get("Indices"), data.get("BlockIds")
-    size_x, size_y, size_z = data.get("SizeX"), data.get("SizeY"), data.get("SizeZ")
-    if not isinstance(origin, dict) or not isinstance(indices, list) or not isinstance(block_ids, list):
-        return None
-    if not indices or len(indices) != len(block_ids):
-        return None
-    if any(origin.get(key) != value for key, value in expected_export(c)["OriginalPos"].items()):
-        return None
-    if not all(isinstance(n, int) and 1 <= n <= maximum for n, maximum in
-               ((size_x, c.size[0]), (size_y, c.size[1]), (size_z, c.size[2]))):
-        return None
-    if any(not isinstance(index, int) or index < 0 or
-           (index & 1023) >= size_x or ((index >> 10) & 1023) >= size_z or
-           (index >> 20) >= size_y for index in indices):
-        return None
-    return {"xmin": c.xmin, "xmax": c.xmin + size_x - 1,
-            "ymin": c.ymin, "ymax": c.ymin + size_y - 1,
-            "zmin": c.zmin, "zmax": c.zmin + size_z - 1}
+    """Return the independently validated, reported three-dimensional envelope."""
+    return capture_plan.inspect_export(path, cuboid_record(c))["covered"]
 
 
 def cuboid_record(c: Cuboid) -> dict[str, int]:
@@ -301,21 +232,12 @@ def cuboid_record(c: Cuboid) -> dict[str, int]:
 
 def cuboid_from_record(parent: Cuboid, bounds: dict[str, int], name: str) -> Cuboid:
     return Cuboid(parent.index, bounds["xmin"], bounds["xmax"], bounds["ymin"],
-                  bounds["ymax"], bounds["zmin"], bounds["zmax"], name, parent.plan_mode)
+                  bounds["ymax"], bounds["zmin"], bounds["zmax"], name)
 
 
 def uncovered_remainder(c: Cuboid, returned: dict[str, int] | None) -> list[dict[str, int]]:
-    """Describe the unreturned suffixes, assuming WorldEdit anchors at OriginalPos."""
-    if returned is None:
-        return [cuboid_record(c)]
-    gaps: list[dict[str, int]] = []
-    if returned["xmax"] < c.xmax:
-        gaps.append({"xmin": returned["xmax"] + 1, "xmax": c.xmax,
-                     "ymin": c.ymin, "ymax": c.ymax, "zmin": c.zmin, "zmax": c.zmax})
-    if returned["zmax"] < c.zmax:
-        gaps.append({"xmin": c.xmin, "xmax": returned["xmax"],
-                     "ymin": c.ymin, "ymax": c.ymax, "zmin": returned["zmax"] + 1, "zmax": c.zmax})
-    return gaps
+    """Return exact missing X/Y/Z regions, without treating shortened Y as air."""
+    return capture_plan.difference([cuboid_record(c)], [returned] if returned else [])
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
@@ -326,11 +248,9 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     manifest_path = path.with_name(path.stem.replace("-progress", "-coverage") + ".json")
     manifest = {
         "signature": state.get("signature"), "updated_utc": state["updated_utc"],
-        "coverage_basis": "Returned X/Z bounds use OriginalPos plus SizeX/SizeZ; unreturned suffixes are reported as gaps. This is WorldEdit's reported extent, not proof of why it was shortened.",
+        "coverage_basis": "Execution checkpoint only. Use the saved plan's independent 3D audit for verified coverage and exact height gaps.",
         "sections": state.get("sections", {}),
     }
-    if state.get("signature", {}).get("capture_plan_hash"):
-        manifest["coverage_basis"] = "Execution checkpoint only. Use the saved v12 plan's independent 3D audit for verified coverage and exact height gaps."
     manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     manifest_tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     manifest_tmp.replace(manifest_path)
@@ -338,14 +258,10 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 
 def load_state(path: Path, signature: dict[str, Any]) -> dict[str, Any]:
     if path.exists():
-        try:
-            old = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            old = {}
-        if old.get("signature") == signature:
-            return old
-        if old:
-            print("Saved progress belongs to a different capture plan; starting a separate record.")
+        old = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(old, dict) or old.get("signature") != signature:
+            raise ValueError("Existing progress uses another plan/export directory; refusing to overwrite it")
+        return old
     return {"signature": signature, "sections": {}, "updated_utc": None}
 
 
@@ -434,9 +350,16 @@ def pause_after_interrupt(state: dict[str, Any], state_path: Path) -> None:
         abort_immediately()
 
 
+def paste_commands(command_path: Path, target_pane: str, tmux_binary: str = "tmux") -> None:
+    """Use the same tmux executable for selection, export, and teleport commands."""
+    subprocess.run([tmux_binary, "load-buffer", str(command_path), ";",
+                    "paste-buffer", "-d", "-t", target_pane], check=True)
+
+
 def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Path,
                        export_dir: Path, state: dict[str, Any], state_path: Path,
-                       confirm: bool = True, verbose: bool = True) -> tuple[str, list[str]]:
+                       confirm: bool = True, verbose: bool = True,
+                       tmux_binary: str = "tmux") -> tuple[str, list[str]]:
     """Send one section export and return complete/incomplete/skipped plus problems."""
     output_path = export_dir / f"{c.name}.json"
     archive_invalid(output_path)
@@ -457,8 +380,7 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
         if choice not in ("", "y", "yes"):
             print("No action taken; press Return to send, n to skip, or q to quit.")
             return "not-sent", []
-    subprocess.run([Path("~/bin/tmux").expanduser(), "load-buffer", str(command_path), ";",
-                    "paste-buffer", "-d", "-t", target_pane], check=True)
+    paste_commands(command_path, target_pane, tmux_binary)
     if confirm or verbose:
         print("Commands pasted. Waiting for the export file to appear.")
     state["sections"][c.name] = {"status": "waiting", "file": str(output_path)}
@@ -476,14 +398,13 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
         return "incomplete", problems
     state["sections"][c.name] = {"status": "complete", "file": str(output_path),
                                  "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    if c.plan_mode:
-        evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
-        state["sections"][c.name].update(returned_bounds=evidence["covered"],
-                                         ceiling_blocks=evidence["ceiling_blocks"])
-        if evidence["ceiling_blocks"]:
-            print(f"\nHeight warning: {evidence['ceiling_blocks']} entries reach requested Y ceiling {c.ymax} in {c.name}.")
-        if evidence["covered"] and evidence["covered"]["ymax"] < c.ymax:
-            print(f"\nHeight coverage unresolved: {c.name} reports Y through {evidence['covered']['ymax']}; requested through {c.ymax}.")
+    evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
+    state["sections"][c.name].update(returned_bounds=evidence["covered"],
+                                     ceiling_blocks=evidence["ceiling_blocks"])
+    if evidence["ceiling_blocks"]:
+        print(f"\nHeight warning: {evidence['ceiling_blocks']} entries reach requested Y ceiling {c.ymax} in {c.name}.")
+    if evidence["covered"] and evidence["covered"]["ymax"] < c.ymax:
+        print(f"\nHeight coverage unresolved: {c.name} reports Y through {evidence['covered']['ymax']}; requested through {c.ymax}.")
     save_state(state_path, state)
     if not confirm and not verbose:
         print("complete")
@@ -491,7 +412,8 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
 
 
 def teleport_player_to_cuboid(c: Cuboid, player: str, target_pane: str,
-                              command_dir: Path, verbose: bool = True) -> Path:
+                              command_dir: Path, verbose: bool = True,
+                              tmux_binary: str = "tmux") -> Path:
     """Request creative mode and teleport using the same X/Z coordinates as `/we select`."""
     x = (c.xmin + c.xmax) // 2
     y = max(c.ymin, c.ymax - 2)
@@ -500,8 +422,7 @@ def teleport_player_to_cuboid(c: Cuboid, player: str, target_pane: str,
     command_path.write_text(f"/gm {player} creative\n/tp {player} {x} {y} {z}\n", encoding="utf-8")
     if verbose:
         print(f"Teleport command file ready: {command_path}")
-    subprocess.run([Path("~/bin/tmux").expanduser(), "load-buffer", str(command_path), ";",
-                    "paste-buffer", "-d", "-t", target_pane], check=True)
+    paste_commands(command_path, target_pane, tmux_binary)
     if verbose:
         print(f"Teleport sent ({x}, {y}, {z}).")
     return command_path
@@ -510,7 +431,7 @@ def teleport_player_to_cuboid(c: Cuboid, player: str, target_pane: str,
 def recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
                           command_dir: Path, export_dir: Path, state: dict[str, Any],
                           state_path: Path, status_reporter: RunStatus,
-                          verbose: bool = False
+                          verbose: bool = False, tmux_binary: str = "tmux"
                           ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
     """Pause on Ctrl-C at the current region, retaining completed siblings."""
     restart_pending = False
@@ -518,7 +439,7 @@ def recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
         try:
             return _recover_automatically(c, depth, player, target_pane, command_dir,
                                           export_dir, state, state_path, status_reporter,
-                                          verbose, restart_pending)
+                                          verbose, restart_pending, tmux_binary)
         except KeyboardInterrupt:
             pause_after_interrupt(state, state_path)
             # A file received while paused is not a validated save. Send this
@@ -529,7 +450,7 @@ def recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
 def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
                            command_dir: Path, export_dir: Path, state: dict[str, Any],
                            state_path: Path, status_reporter: RunStatus,
-                           verbose: bool, restart_pending: bool
+                           verbose: bool, restart_pending: bool, tmux_binary: str
                            ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
     """Attempt, teleport and retry, then split at most twice before asking."""
     output_path = export_dir / f"{c.name}.json"
@@ -567,7 +488,7 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
             child = cuboid_from_record(c, item, item["name"])
             child_pieces, child_gaps = recover_automatically(
                 child, item["depth"], player, target_pane, command_dir, export_dir,
-                state, state_path, status_reporter, verbose)
+                state, state_path, status_reporter, verbose, tmux_binary)
             leaves.extend(child_pieces)
             gaps.extend(child_gaps)
             checkpoint(children[index + 1:])
@@ -596,7 +517,8 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
         else:
             print(f"selecting {c.size[0]}x{c.size[1]}x{c.size[2]} for export ... ", end="", flush=True)
         result = run_export_attempt(c, player, target_pane, command_dir, export_dir,
-                                    state, state_path, confirm=False, verbose=verbose)
+                                    state, state_path, confirm=False, verbose=verbose,
+                                    tmux_binary=tmux_binary)
         if verbose:
             print(f"Export {result[0]} for {region_label(c)}.")
             for problem in result[1]:
@@ -609,7 +531,8 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
         return [(c, output_path)], []
 
     print("teleporting ... ", end="", flush=True)
-    teleport_player_to_cuboid(c, player, target_pane, command_dir, verbose=verbose)
+    teleport_player_to_cuboid(c, player, target_pane, command_dir, verbose=verbose,
+                              tmux_binary=tmux_binary)
     print(f"waiting {AUTO_TELEPORT_DELAY}s ... ", end="", flush=True)
     time.sleep(AUTO_TELEPORT_DELAY)
     print("ready")
@@ -651,7 +574,8 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
 
 def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
                          command_dir: Path, export_dir: Path, state: dict[str, Any],
-                         state_path: Path, split_immediately: bool = False
+                         state_path: Path, split_immediately: bool = False,
+                         tmux_binary: str = "tmux"
                          ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
     """Retry or split a failed region; retain partial exports and report explicit gaps."""
     output_path = export_dir / f"{c.name}.json"
@@ -667,7 +591,8 @@ def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
         gaps: list[dict[str, int]] = []
         for child in split_largest_dimension(c, f"{c.name}_d{depth+1}"):
             child_leaves, child_gaps = recover_by_splitting(
-                child, depth + 1, player, target_pane, command_dir, export_dir, state, state_path)
+                child, depth + 1, player, target_pane, command_dir, export_dir, state, state_path,
+                tmux_binary=tmux_binary)
             leaves.extend(child_leaves)
             gaps.extend(child_gaps)
         state["sections"][c.name] = {
@@ -713,7 +638,8 @@ def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
                         f"_y{bounds['ymin']}_{bounds['ymax']}_z{bounds['zmin']}_{bounds['zmax']}")
             gap_cuboid = cuboid_from_record(c, bounds, gap_name)
             gap_pieces, gap_remainder = recover_by_splitting(
-                gap_cuboid, depth, player, target_pane, command_dir, export_dir, state, state_path)
+                gap_cuboid, depth, player, target_pane, command_dir, export_dir, state, state_path,
+                tmux_binary=tmux_binary)
             leaves.extend(gap_pieces)
             remaining.extend(gap_remainder)
         state["sections"][c.name] = {
@@ -738,7 +664,8 @@ def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
     retry_confirm = True
     while True:
         status, problems = run_export_attempt(c, player, target_pane, command_dir,
-                                              export_dir, state, state_path, retry_confirm)
+                                              export_dir, state, state_path, retry_confirm,
+                                              tmux_binary=tmux_binary)
         if status == "complete":
             outcome = "Retry succeeded" if not retry_confirm else "Export passed validation"
             print(f"{outcome} for {region_label(c)}; WorldEdit returned "
@@ -783,7 +710,8 @@ def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
                 save_state(state_path, state)
                 return pieces, gaps
             if choice == "t" and can_teleport:
-                teleport_player_to_cuboid(c, player, target_pane, command_dir)
+                teleport_player_to_cuboid(c, player, target_pane, command_dir,
+                                          tmux_binary=tmux_binary)
                 while True:
                     ready = input("After the player arrives and the client has synchronized, press Return to issue the capture again; q to quit: ").strip().lower()
                     if ready == "q":
@@ -842,179 +770,9 @@ def finalize_split_result(c: Cuboid, pieces: list[tuple[Cuboid, Path]], gaps: li
         print("No usable export pieces were returned; the full section is recorded as an uncovered region.")
 
 
-def xz_union_area(rectangles: list[dict[str, int]]) -> int:
-    """Count the X/Z footprint without double-counting overlapping rectangles."""
-    if not rectangles:
-        return 0
-    x_edges = sorted({edge for rect in rectangles for edge in (rect["xmin"], rect["xmax"] + 1)})
-    area = 0
-    for left, right in zip(x_edges, x_edges[1:]):
-        intervals = sorted((rect["zmin"], rect["zmax"] + 1) for rect in rectangles
-                           if rect["xmin"] <= left and rect["xmax"] + 1 >= right)
-        if not intervals:
-            continue
-        z_total = 0
-        start, end = intervals[0]
-        for next_start, next_end in intervals[1:]:
-            if next_start <= end:
-                end = max(end, next_end)
-            else:
-                z_total += end - start
-                start, end = next_start, next_end
-        z_total += end - start
-        area += (right - left) * z_total
-    return area
-
-
-def xz_complement(c: Cuboid, rectangles: list[dict[str, int]]) -> list[dict[str, int]]:
-    """Return uncovered X/Z rectangles inside a planned cuboid."""
-    clipped = []
-    for rect in rectangles:
-        xmin, xmax = max(c.xmin, rect["xmin"]), min(c.xmax, rect["xmax"])
-        zmin, zmax = max(c.zmin, rect["zmin"]), min(c.zmax, rect["zmax"])
-        if xmin <= xmax and zmin <= zmax:
-            clipped.append({"xmin": xmin, "xmax": xmax, "zmin": zmin, "zmax": zmax})
-    x_edges = sorted({c.xmin, c.xmax + 1,
-                      *(edge for rect in clipped for edge in (rect["xmin"], rect["xmax"] + 1))})
-    gaps: list[dict[str, int]] = []
-    for left, right in zip(x_edges, x_edges[1:]):
-        intervals = sorted((rect["zmin"], rect["zmax"] + 1) for rect in clipped
-                           if rect["xmin"] <= left and rect["xmax"] + 1 >= right)
-        merged: list[list[int]] = []
-        for start, end in intervals:
-            if merged and start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], end)
-            else:
-                merged.append([start, end])
-        cursor = c.zmin
-        for start, end in merged:
-            if cursor < start:
-                gaps.append({"xmin": left, "xmax": right - 1, "ymin": c.ymin, "ymax": c.ymax,
-                             "zmin": cursor, "zmax": start - 1})
-            cursor = max(cursor, end)
-        if cursor <= c.zmax:
-            gaps.append({"xmin": left, "xmax": right - 1, "ymin": c.ymin, "ymax": c.ymax,
-                         "zmin": cursor, "zmax": c.zmax})
-    return gaps
-
-
-def parse_piece_cuboid(path: Path, parent: Cuboid, item: dict[str, Any] | None = None) -> Cuboid | None:
-    if item and all(key in item for key in ("xmin", "xmax", "ymin", "ymax", "zmin", "zmax")):
-        bounds = {key: int(item[key]) for key in ("xmin", "xmax", "ymin", "ymax", "zmin", "zmax")}
-    else:
-        x_match = list(re.finditer(r"_x(-?\d+)_(-?\d+)", path.stem))
-        z_match = list(re.finditer(r"_z(-?\d+)_(-?\d+)", path.stem))
-        if not x_match or not z_match:
-            return None
-        bounds = {"xmin": int(x_match[-1].group(1)), "xmax": int(x_match[-1].group(2)),
-                  "ymin": parent.ymin, "ymax": parent.ymax,
-                  "zmin": int(z_match[-1].group(1)), "zmax": int(z_match[-1].group(2))}
-    if bounds["xmin"] > bounds["xmax"] or bounds["zmin"] > bounds["zmax"]:
-        return None
-    return cuboid_from_record(parent, bounds, path.stem)
-
-
-def report_coverage(prefix: str, verbose: bool) -> int:
-    state_path = Path(__file__).with_name(f"{prefix}-progress.json")
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        print(f"Could not read progress record {state_path}: {exc}", file=sys.stderr)
-        return 2
-    signature = state.get("signature", {})
-    bounds = signature.get("bounds", {})
-    try:
-        cuboids, _ = route_corridor_slices(bounds["ymin"], bounds["ymax"],
-                                           int(signature["z_span"]), prefix)
-    except (KeyError, TypeError, ValueError) as exc:
-        print(f"Progress record does not contain a usable capture plan: {exc}", file=sys.stderr)
-        return 2
-
-    sections = state.get("sections", {})
-    total_area = sum(c.size[0] * c.size[2] for c in cuboids)
-    covered_rectangles: list[dict[str, int]] = []
-    gaps_to_report: list[tuple[int, dict[str, int]]] = []
-    for c in cuboids:
-        record = sections.get(c.name, {})
-        record_status = record.get("status")
-        section_coverage: list[dict[str, int]] = []
-        full_file = Path(record["file"]) if record.get("file") else None
-        if (record_status == "complete" and not record.get("gaps") and
-                full_file is not None and full_file.is_file()):
-            section_coverage = [cuboid_record(c)]
-        else:
-            piece_items = record.get("piece_regions", [])
-            piece_paths = record.get("pieces", [])
-            if piece_items:
-                for item in piece_items:
-                    path = Path(item.get("file", ""))
-                    piece = parse_piece_cuboid(path, c, item)
-                    if piece and path.is_file():
-                        box = returned_export_bounds(path, piece)
-                        if box:
-                            section_coverage.append(box)
-            elif piece_paths:
-                for filename in piece_paths:
-                    path = Path(filename)
-                    piece = parse_piece_cuboid(path, c)
-                    if piece and path.is_file():
-                        box = returned_export_bounds(path, piece)
-                        if box:
-                            section_coverage.append(box)
-
-            if not section_coverage:
-                filename = record.get("file") or str(Path(signature.get("export_dir", "")) / f"{c.name}.json")
-                path = Path(filename)
-                if path.is_file():
-                    box = returned_export_bounds(path, c)
-                    if box:
-                        section_coverage.append(box)
-                    elif not validate_export(path, c):
-                        section_coverage.append(cuboid_record(c))
-
-        covered_rectangles.extend(section_coverage)
-        gaps = record.get("gaps")
-        planned_area = c.size[0] * c.size[2]
-        actual_area = xz_union_area(section_coverage)
-        if gaps is None or (not gaps and actual_area < planned_area):
-            if gaps is not None:
-                gaps = xz_complement(c, section_coverage)
-            else:
-                root_file = Path(record.get("file", "")) if record.get("file") else None
-                returned = returned_export_bounds(root_file, c) if root_file and root_file.is_file() else None
-                gaps = uncovered_remainder(c, returned)
-        for gap in gaps:
-            gaps_to_report.append((c.index, gap))
-
-    covered_area = xz_union_area(covered_rectangles)
-    percent = 100.0 * covered_area / total_area if total_area else 0.0
-    print(f"Coverage for {prefix}: {covered_area:,} of {total_area:,} planned X/Z blocks ({percent:.2f}%).")
-    print(f"Recorded gaps: {len(gaps_to_report)} region(s); progress: {state_path}")
-    if verbose:
-        if not gaps_to_report:
-            print("No gaps are recorded.")
-        else:
-            print("Gap bounds (inclusive):")
-            for section_index, gap in sorted(gaps_to_report,
-                                             key=lambda entry: (entry[0], entry[1]["zmin"], entry[1]["xmin"])):
-                print(f"  Section {section_index}: X {gap['xmin']}..{gap['xmax']}, "
-                      f"Y {gap['ymin']}..{gap['ymax']}, Z {gap['zmin']}..{gap['zmax']}")
-    if covered_area or gaps_to_report:
-        print("Coverage measures exported X/Z envelopes; the manifest does not establish why a shortened export omitted an edge.")
-    return 0
-
-
 def prompt_value(label: str, default: str) -> str:
     value = input(f"{label} [{default}]: ").strip()
     return value or default
-
-
-def read_y_bounds() -> dict[str, int]:
-    print("Vertical bounds are inclusive. X/Z captures follow the buffered tentative channel route.")
-    bounds = {key: int(prompt_value(key, str(value))) for key, value in DEFAULT_Y_BOUNDS.items()}
-    if bounds["ymin"] > bounds["ymax"]:
-        raise ValueError("ymin must be <= ymax")
-    return bounds
 
 
 def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path) -> int:
@@ -1035,60 +793,46 @@ def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target-pane",
-                        help="tmux target pane that receives the confirmed WorldEdit command paste")
-    parser.add_argument("--z-span", type=int, default=DEFAULT_Z_SPAN,
-                        help=f"Z length of each route-following slice (default: {DEFAULT_Z_SPAN}; max 1023)")
-    parser.add_argument("--prefix", help="export prefix; also selects the saved progress record")
-    parser.add_argument("--plan", type=Path, help="use a saved v12 capture plan; legacy route mode is unchanged")
-    parser.add_argument("--preview", action="store_true", help="render a saved --plan and exit without sending commands")
-    parser.add_argument("--export-dir", type=Path, help="WorldEdit JSON directory (otherwise prompted or read from plan progress for a report)")
+    parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN,
+                        help="saved coastline capture plan (default: capture-plans/coastal-connection/plan.json beside the script)")
+    parser.add_argument("--target-pane", help="tmux pane containing the server console")
+    parser.add_argument("--tmux-binary", type=Path,
+                        help="specific tmux executable; otherwise use tmux from PATH")
+    parser.add_argument("--preview", action="store_true",
+                        help="render the saved plan and exit without sending commands")
+    parser.add_argument("--export-dir", type=Path,
+                        help="directory containing WorldEdit JSON exports (otherwise prompted, or read from progress for a report)")
     parser.add_argument("--report-coverage", action="store_true",
-                        help="report saved X/Z coverage and exit without prompting or sending commands")
-    parser.add_argument("--verbose", action="store_true",
-                        help="print detailed bounds, validation problems, and command-file activity")
+                        help="revalidate exports and report exact X/Y/Z coverage without sending commands")
+    parser.add_argument("--verbose", action="store_true", help="print bounds and validation details")
     parser.add_argument("--step-by-step", action="store_true",
-                        help="use the approval-driven workflow instead of automatic retries and splitting")
+                        help="confirm each export instead of using automatic recovery")
     args = parser.parse_args()
-    plan = None
-    if args.plan:
-        try:
-            args.plan = args.plan.expanduser().resolve()
-            plan = capture_plan.load_plan(args.plan)
-            if args.prefix is not None or args.z_span != DEFAULT_Z_SPAN:
-                parser.error("--prefix and --z-span belong to legacy mode; v12 settings are saved in --plan")
-            capture_plan.render_preview(plan, args.plan.with_suffix(".svg"))
-            if args.preview:
-                capture_plan.print_summary(plan, args.plan)
-                return 0
-            if args.report_coverage:
-                progress = args.plan.with_name(plan["prefix"] + "-progress.json")
-                state = capture_plan.read_json(progress) if progress.exists() else {}
-                if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
-                    raise ValueError("Progress belongs to another capture plan")
-                export_path = args.export_dir or state.get("signature", {}).get("export_dir")
-                if not export_path:
-                    parser.error("--export-dir is required until this plan has a saved run")
-                return write_plan_audit(plan, args.plan, state, Path(export_path).expanduser())
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            parser.error(str(exc))
-    elif args.preview:
-        parser.error("--preview requires --plan")
-    if args.report_coverage:
-        report_prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", args.prefix or "channel_capture")
-        return report_coverage(report_prefix, args.verbose)
-    if not args.target_pane:
-        parser.error("--target-pane is required unless --report-coverage is used")
-    target_pane = args.target_pane.strip()
-    if not target_pane:
-        parser.error("--target-pane must not be empty")
-    if not 1 <= args.z_span <= 1023:
-        parser.error("--z-span must be between 1 and 1023")
+    if not args.preview and not args.report_coverage and not (args.target_pane or "").strip():
+        parser.error("--target-pane is required for collection")
+    args.plan = args.plan.expanduser().resolve()
+    try:
+        plan = capture_plan.load_plan(args.plan)
+        capture_plan.render_preview(plan, args.plan.with_suffix(".svg"))
+        if args.preview:
+            capture_plan.print_summary(plan, args.plan)
+            return 0
+        if args.report_coverage:
+            progress = args.plan.with_name(plan["prefix"] + "-progress.json")
+            state = capture_plan.read_json(progress) if progress.exists() else {}
+            if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
+                raise ValueError("Progress belongs to a different capture plan")
+            export_path = args.export_dir or state.get("signature", {}).get("export_dir")
+            if not export_path:
+                parser.error("--export-dir is required until this plan has a saved run")
+            return write_plan_audit(plan, args.plan, state, Path(export_path).expanduser().resolve())
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        parser.error(str(exc))
 
-    print("Vintage Story WorldEdit export coordinator (terrain is never modified).")
+    target_pane = args.target_pane.strip()
+    tmux_binary = str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else "tmux"
+    print("Vintage Story coastline export coordinator (terrain is never modified).")
     print("Mode: " + ("step-by-step" if args.step_by_step else "automatic"))
-    y_bounds = plan["requested_y"] if plan else read_y_bounds()
-    z_span = args.z_span
     player = prompt_value("Player name for /executeas", DEFAULT_PLAYER)
     export_dir = args.export_dir or Path(prompt_value(
         "WorldEdit export directory",
@@ -1096,49 +840,30 @@ def main() -> int:
     ))
     export_dir = export_dir.expanduser().resolve()
     if not export_dir.is_dir():
-        print(f"Directory does not exist: {export_dir}\nCreate it or enter the correct server WorldEdit directory, then rerun.")
+        print(f"Export directory does not exist: {export_dir}. Enter the actual WorldEdit export directory.")
         return 2
-    if plan:
-        prefix = plan["prefix"]
-    else:
-        prefix_input = args.prefix if args.prefix is not None else prompt_value("Export name prefix", "channel_capture")
-        prefix = re.sub(r"[^A-Za-z0-9_-]+", "_", prefix_input)
 
-    if plan:
-        cuboids = [Cuboid(item["index"], **capture_plan.box(item), name=item["name"], plan_mode=True)
-                   for item in plan["cuboids"]]
-        bounds = {key: (min if key.endswith("min") else max)(b[key] for b in plan["requests"])
-                  for key in capture_plan.BOUND_KEYS}
-        print(f"Saved v12 plan: {args.plan}\nRequested footprint and cuboid preview: {args.plan.with_suffix('.svg')}")
-        print(f"Geometry: {plan['geometry_version']} / {plan['geometry_hash']}\nRequested initial Y: {y_bounds['ymin']}..{y_bounds['ymax']}")
-        print(f"Initial horizontal caps: X {plan['partition'].get('x_span', capture_plan.MAX_SIDE)}, Z {plan['partition']['z_span']} blocks.")
-    else:
-        cuboids, bounds = route_corridor_slices(y_bounds["ymin"], y_bounds["ymax"], z_span, prefix)
-    oversized = [c for c in cuboids if max(c.size) > 1023 or
-                 c.size[0] * c.size[1] * c.size[2] > MAX_SELECTION_BLOCKS]
-    if oversized:
-        worst = max(oversized, key=lambda c: c.size[0] * c.size[1] * c.size[2])
-        print(
-            f"Requested slice size exceeds safety limits (largest is {worst.size[0]}×{worst.size[1]}×{worst.size[2]}). "
-            f"Reduce --z-span; each dimension must be <=1023 and volume <={MAX_SELECTION_BLOCKS:,}."
-        )
-        return 2
-    run_dir = args.plan.parent if plan else Path(__file__).parent
+    prefix = plan["prefix"]
+    cuboids = [Cuboid(item["index"], **capture_plan.box(item), name=item["name"])
+               for item in plan["cuboids"]]
+    bounds = {key: (min if key.endswith("min") else max)(b[key] for b in plan["requests"])
+              for key in capture_plan.BOUND_KEYS}
+    y_bounds = plan["requested_y"]
+    print(f"Saved coastline plan: {args.plan}\nFootprint and cuboid preview: {args.plan.with_suffix('.svg')}")
+    print(f"Geometry: {plan['geometry_version']} / {plan['geometry_hash']}")
+    print(f"Requested initial Y: {y_bounds['ymin']}..{y_bounds['ymax']}")
+    print(f"Initial horizontal caps: X {plan['partition'].get('x_span', capture_plan.MAX_SIDE)}, Z {plan['partition']['z_span']} blocks.")
+    run_dir = args.plan.parent
     command_dir = run_dir / f"{prefix}-commands"
-    command_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Command files are stored in: {command_dir}")
-    signature = {"bounds": bounds, "z_span": z_span,
-                 "channel_max_width": CHANNEL_MAX_WIDTH, "capture_margin": CAPTURE_MARGIN,
-                 "north_extra": NORTH_EXTRA, "route_xz": ROUTE_XZ,
-                 "player": player, "target_pane": target_pane,
-                 "export_dir": str(export_dir.resolve()), "prefix": prefix}
-    if plan:
-        signature = {"capture_plan_hash": plan["plan_hash"], "geometry_hash": plan["geometry_hash"],
-                     "bounds": bounds, "export_dir": str(export_dir), "prefix": prefix}
+    signature = {"capture_plan_hash": plan["plan_hash"], "geometry_hash": plan["geometry_hash"],
+                 "bounds": bounds, "export_dir": str(export_dir), "prefix": prefix}
     state_path = run_dir / f"{prefix}-progress.json"
-    if plan and state_path.exists() and capture_plan.read_json(state_path).get("signature") != signature:
-        parser.error("Existing v12 progress uses another plan/export directory; refusing to overwrite it")
-    state = load_state(state_path, signature)
+    try:
+        state = load_state(state_path, signature)
+        command_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, ValueError, TypeError) as exc:
+        parser.error(str(exc))
+    print(f"Command files: {command_dir}")
     status_reporter = RunStatus(cuboids, state)
     complete_now = accepted_now = incomplete_now = absent_now = 0
     for c in cuboids:
@@ -1151,34 +876,22 @@ def main() -> int:
                     accepted_now += 1
                 else:
                     complete_now += 1
-                    state["sections"][c.name] = {**(previous if plan else {}), "status": "complete", "file": str(output_path),
+                    state["sections"][c.name] = {**previous, "status": "complete", "file": str(output_path),
                                                  "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
             else:
                 incomplete_now += 1
                 if not (previous.get("segmented") or
                         (previous.get("status") == "partial" and previous.get("gaps"))):
                     state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
-        elif (previous.get("status") in ("complete", "accepted") and
-              not previous.get("segmented")):
+        elif (previous.get("status") in ("complete", "accepted") and not previous.get("segmented")):
             state["sections"].pop(c.name, None)
             absent_now += 1
         else:
             absent_now += 1
     save_state(state_path, state)
     max_volume = max(c.size[0] * c.size[1] * c.size[2] for c in cuboids)
-    max_x_span = max(c.size[0] for c in cuboids)
-    coverage_path = state_path.with_name(state_path.stem.replace("-progress", "-coverage") + ".json")
-    if plan:
-        print(f"Capture plan: {len(cuboids)} nonoverlapping v12 cuboids; largest selection {max_volume:,} blocks.")
-        print(f"Progress: {state_path}\nVerified {complete_now}; incomplete {incomplete_now}; pending {absent_now}.")
-    elif args.verbose or args.step_by_step:
-        print(f"\nCapture plan: {len(cuboids)} route-following Z slices; X span varies up to {max_x_span}, Y is {bounds['ymax']-bounds['ymin']+1}, Z is at most {z_span} blocks.")
-        print(f"Largest planned selection: {max_volume:,} blocks.")
-        print(f"Buffered route corridor extents: X {bounds['xmin']}..{bounds['xmax']}, Z {bounds['zmin']}..{bounds['zmax']}.")
-        print(f"Current files: {complete_now} verified, {accepted_now} previously accepted, {incomplete_now} incomplete, {absent_now} not present.")
-        print(f"Progress record: {state_path}\nCoverage and gap manifest: {coverage_path}\nExports watched in: {export_dir}\n")
-    else:
-        print(f"Ready: {len(cuboids)} sections; {complete_now} verified, {incomplete_now} incomplete, {absent_now} pending.")
+    print(f"Capture plan: {len(cuboids)} nonoverlapping cuboids; largest selection {max_volume:,} blocks.")
+    print(f"Progress: {state_path}\nVerified {complete_now}; accepted {accepted_now}; incomplete {incomplete_now}; pending {absent_now}.")
     if not args.step_by_step:
         print("Ctrl-C pauses; r retries, q quits, a second Ctrl-C aborts.")
 
@@ -1192,7 +905,7 @@ def main() -> int:
                 print(f"Section {c.index}/{len(cuboids)} already complete or accepted; moving on.")
                 continue
             if output_path.exists() and not validate_export(output_path, c):
-                state["sections"][c.name] = {**(record if plan else {}), "status": "complete", "file": str(output_path),
+                state["sections"][c.name] = {**record, "status": "complete", "file": str(output_path),
                                              "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
                 save_state(state_path, state)
                 continue
@@ -1206,7 +919,7 @@ def main() -> int:
                     try:
                         pieces, gaps = recover_automatically(
                             c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                            status_reporter, args.verbose)
+                            status_reporter, args.verbose, tmux_binary)
                         record = state["sections"].get(c.name, {})
                         if record.get("segmented") or gaps:
                             finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
@@ -1219,13 +932,14 @@ def main() -> int:
                 print("Resuming the recorded split regions; the larger parent selection will not be retried.")
                 pieces, gaps = recover_by_splitting(
                     c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                    split_immediately=True)
+                    split_immediately=True, tmux_binary=tmux_binary)
                 finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
                 continue
             retry_confirm = True
             while True:
                 status, problems = run_export_attempt(c, player, target_pane, command_dir,
-                                                      export_dir, state, state_path, retry_confirm)
+                                                      export_dir, state, state_path, retry_confirm,
+                                                      tmux_binary=tmux_binary)
                 if status == "not-sent":
                     continue
                 if status == "skipped":
@@ -1269,23 +983,13 @@ def main() -> int:
 
                 pieces, gaps = recover_by_splitting(
                     c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                    split_immediately=True)
+                    split_immediately=True, tmux_binary=tmux_binary)
                 finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
                 break
-        has_gaps = any(record.get("gaps") or record.get("status") not in ("complete", "accepted")
-                       for record in state["sections"].values())
-        if plan:
-            result = write_plan_audit(plan, args.plan, state, export_dir)
-            state["finished"] = result == 0
-            save_state(state_path, state)
-            return result
-        state["finished"] = not has_gaps
+        result = write_plan_audit(plan, args.plan, state, export_dir)
+        state["finished"] = result == 0
         save_state(state_path, state)
-        if has_gaps:
-            print(f"All sections were processed. Uncovered regions are recorded in {coverage_path}.")
-        else:
-            print("All sections are complete or accepted.")
-        return 0
+        return result
     except (KeyboardInterrupt, EOFError, UserQuit):
         signal.signal(signal.SIGINT, abort_immediately)
         if try_save_state(state_path, state):

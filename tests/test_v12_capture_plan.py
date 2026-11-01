@@ -247,8 +247,25 @@ class PlanTests(unittest.TestCase):
             self.assertFalse(corrupt['complete'])
             args = ['coordinator', '--plan', str(path), '--export-dir', str(directory), '--report-coverage']
             with patch('sys.argv', args), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', side_effect=AssertionError('No prompts allowed')), patch('sys.stdout', new=io.StringIO()):
-                with patch.object(coordinator, 'route_corridor_slices', side_effect=AssertionError('Saved geometry only')):
-                    self.assertEqual(coordinator.main(), 1)
+                self.assertEqual(coordinator.main(), 1)
+
+    def test_default_plan_preview_and_missing_plan_never_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = p.write_plan(self.banded, Path(tmp) / 'plan.json')
+            with patch.object(coordinator, 'DEFAULT_PLAN', path), patch('sys.argv', ['coordinator', '--preview']), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', side_effect=AssertionError('No prompts allowed')), patch('sys.stdout', new=io.StringIO()):
+                self.assertEqual(coordinator.main(), 0)
+            args = ['coordinator', '--plan', str(Path(tmp)/'missing.json'), '--preview']
+            with patch('sys.argv', args), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', side_effect=AssertionError('No prompts allowed')), patch('sys.stderr', new=io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    coordinator.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_collector_rejects_removed_geometry_options(self):
+        for arguments in (['--prefix', 'old_capture'], ['--z-span', '50']):
+            with patch('sys.argv', ['coordinator', '--preview', *arguments]), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', side_effect=AssertionError('No prompts allowed')), patch('sys.stderr', new=io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    coordinator.main()
+                self.assertEqual(error.exception.code, 2)
 
     def test_coordinator_reuses_existing_exports_and_resumes_without_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -304,7 +321,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_command_execution_keeps_existing_protocol_and_records_height(self):
         directory = Path(self.temp.name)
-        c = coordinator.Cuboid(1, **self.b, name='v12_test', plan_mode=True)
+        c = coordinator.Cuboid(1, **self.b, name='v12_test')
         output = directory / 'v12_test.json'
         def simulate_server(*args, **kwargs):
             output.write_text(json.dumps(export_data(self.b, ceiling=True)))
@@ -314,6 +331,7 @@ class EvidenceTests(unittest.TestCase):
             status, problems = coordinator.run_export_attempt(c, 'Player', '%9', directory, directory, state, state_path, confirm=False, verbose=False)
         self.assertEqual((status, problems), ('complete', []))
         self.assertEqual(sent.call_count, 1)
+        self.assertEqual(sent.call_args.args[0][0], 'tmux')
         command = (directory / 'v12_test.txt').read_text()
         self.assertEqual(command, '/executeas Player /we select -5 65 4 4 180 13\n/executeas Player /we export v12_test\n')
         self.assertEqual(state['sections'][c.name]['ceiling_blocks'], 1)
@@ -321,9 +339,9 @@ class EvidenceTests(unittest.TestCase):
     def test_merged_provenance_cannot_hide_child_y_gap_without_progress(self):
         # One X half is short, the other reaches full height. A merged SizeY
         # alone would falsely imply the first half's upper volume was captured.
-        parent = coordinator.Cuboid(1, **self.b, name='parent', plan_mode=True)
-        left = coordinator.Cuboid(1, **{**self.b, 'xmax': -1}, name='left', plan_mode=True)
-        right = coordinator.Cuboid(1, **{**self.b, 'xmin': 0}, name='right', plan_mode=True)
+        parent = coordinator.Cuboid(1, **self.b, name='parent')
+        left = coordinator.Cuboid(1, **{**self.b, 'xmax': -1}, name='left')
+        right = coordinator.Cuboid(1, **{**self.b, 'xmin': 0}, name='right')
         directory = Path(self.temp.name)
         pieces = []
         for c, sy in ((left, 100), (right, 116)):
@@ -335,6 +353,36 @@ class EvidenceTests(unittest.TestCase):
                     plan_hash='test', geometry_hash='test')
         audit = p.audit_coverage(plan, {}, directory)
         self.assertEqual(audit['gaps'], [{**self.b, 'xmax': -1, 'ymin': 165}])
+
+    def test_keep_returned_part_records_missing_height(self):
+        c = coordinator.Cuboid(1, **self.b, name='v12_test')
+        lower = {**self.b, 'ymax': 164}
+        self.assertEqual(coordinator.uncovered_remainder(c, lower), [{**self.b, 'ymin': 165}])
+
+    def test_custom_tmux_survives_retry_teleport_and_subdivision(self):
+        directory = Path(self.temp.name)
+        c = coordinator.Cuboid(1, **self.b, name='v12_test')
+        state = {'signature': {'capture_plan_hash': 'test'}, 'sections': {}}
+        reporter = coordinator.RunStatus([c], state)
+        def simulate_server(command, **kwargs):
+            text = Path(command[2]).read_text()
+            if text.startswith('/gm'):
+                return
+            selection, export = text.splitlines()
+            coords = map(int, selection.split()[4:])
+            region = dict(zip(('xmin', 'ymin', 'zmin', 'xmax', 'ymax', 'zmax'), coords))
+            name = export.split()[-1]
+            data = export_data(region)
+            if name == c.name:
+                data['SizeX'] -= 1  # Force retry, teleport, and then a split.
+            (directory / (name+'.json')).write_text(json.dumps(data))
+        with patch('subprocess.run', side_effect=simulate_server) as sent, patch.object(coordinator, 'stable_file', return_value=True), patch('time.sleep'), patch('sys.stdout', new=io.StringIO()):
+            pieces, gaps = coordinator.recover_automatically(c, 0, 'Player', '%9', directory,
+                directory, state, directory/'progress.json', reporter, tmux_binary='/custom/tmux')
+        self.assertEqual(len(pieces), 2)
+        self.assertFalse(gaps)
+        self.assertEqual(sent.call_count, 5)
+        self.assertTrue(all(call.args[0][0] == '/custom/tmux' for call in sent.call_args_list))
 
 
 if __name__ == '__main__':
