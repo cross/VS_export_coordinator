@@ -1,0 +1,20 @@
+# Python and macOS incidental files
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated plan previews; keep plan.json and coastline source versioned
+/capture-plans/*/plan.svg
+/capture-plans/*/plan.png
+
+# Generated commands, checkpoints, and audit reports
+*-commands/
+*-progress.json
+*-coverage.json
+*-audit.json
+*-coverage.svg
+*.json.tmp
+*.previous-invalid*.json
+
+# Optional dedicated directory for collected world exports
+/exports/
