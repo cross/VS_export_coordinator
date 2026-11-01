@@ -184,11 +184,19 @@ these evidence limits rather than claiming stronger verification.
 
 Normal collection keeps the saved plan's initial Y bounds (currently 65–180).
 When a direct export has columns without any block/decor records, the
-coordinator automatically groups them by 32-by-32 chunk columns and exports
-each affected chunk from Y=0 through that selection's requested ceiling.
-This happens before the usual teleport/retry/subdivision recovery. Existing
-exports with holes also take this path on resume. Multiple holes and neighboring
-selections reuse the same validated probe when its bounds match.
+coordinator first force-loads the selection, teleports the player, checks the
+chunk queues, and retries the selection at its original Y bounds. This avoids
+turning an initially unloaded selection into a large batch of deeper probes.
+Any records recovered by that retry are saved immediately into formerly empty
+columns. Only holes that remain trigger 32-by-32 chunk exports from Y=0 through
+the selection's requested ceiling. Output reports the remaining column count
+and numbers each deeper probe within its finite batch.
+
+This recovery happens before the usual splitting fallback. Existing exports
+with holes also take this path on resume. Multiple holes and neighboring
+selections reuse a deeper probe when its bounds match and its retained data
+still validates. Normal-height retry exports are retained as
+`<prefix>_loaded_<bounds-hash>.json` and recorded in the progress file.
 
 Each fresh probe requests `/executeas PLAYER /chunk forceload ...`, waits for
 its acknowledgement, teleports the player into that chunk, and queries
@@ -229,6 +237,11 @@ A deeper probe can yield three outcomes:
 
 Before changing a parent, the coordinator saves its exact original bytes as
 `NAME.before-rescan-HASH.json` in the export directory. Replacement is atomic.
+Each completed deeper probe is applied to the parent and checkpointed before
+the next probe begins. If interrupted, an audit can credit the completed
+contributions while leaving the rest of the selection unverified. A parent
+with no direct block records can also retain partial, corroborated empty-band
+coverage. It is not marked complete until all columns are resolved.
 The parent includes `ColumnRescanEvidence` containing probe filenames, bounds,
 SHA256 values, load responses, and its backup reference. The progress file's
 `column_rescans` records cached probes and per-section results; commands and
@@ -248,6 +261,14 @@ counts unverified columns after all sources are considered. Full-height credit
 for a corroborated empty band is conditional on WorldEdit correctly returning
 loaded contents; this is operational evidence, not a block-by-block air listing.
 Other trimmed-height gaps remain visible in the ordinary 3D report.
+
+Earlier versions applied probes only after the entire batch completed. An
+interrupted run could therefore have valid probe files and cached hashes but
+still show zero audited coverage for an empty parent. Updated collection
+applies those retained probes first on resume, before sending new commands.
+Reporting itself remains read-only with respect to exports: it does not merge
+unapplied cached probes into their parents. A fresh run should use a separate
+plan/run directory and the target instance's exports without old capture files.
 
 ## Repair reported empty columns
 

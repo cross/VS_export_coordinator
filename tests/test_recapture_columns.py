@@ -1,9 +1,13 @@
 """Non-server tests for repair input validation and lossless column overlay."""
 from copy import deepcopy
+import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import v12_capture_plan as p
 from tools import recapture_columns as repair
@@ -71,6 +75,31 @@ class RepairTests(unittest.TestCase):
         report['empty_column_rectangles'][0]['xmax']=5
         with self.assertRaisesRegex(ValueError,'outside'):
             repair.repair_requests(plan,report,'hash')
+
+    def test_resume_accepts_own_rescan_checkpoint_and_preserves_backup_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); work=root/'work'; (work/'backups').mkdir(parents=True)
+            parent_path=root/'parent.json'
+            parent_path.write_text(json.dumps(self.original))
+            checkpoint_hash=hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            backup=work/'backups'/'parent.json'
+            backup.write_text(json.dumps(data_for(self.parent,[])))
+            backup_hash=hashlib.sha256(backup.read_bytes()).hexdigest()
+            (root/'patch.json').write_text(json.dumps(self.data))
+            results=dict(plan_hash='test',jobs={},parents={},preloads=[],
+                         column_rescans={'sections':{'parent':{'sha256':checkpoint_hash}}})
+            repair.atomic_json(work/'results.json',results)
+            args=SimpleNamespace(tmux_binary=Path('tmux'),target_pane='%1',server_log=root/'server.log',
+                                 export_dir=root,player='Player')
+            requests=dict(regions=[self.patch],jobs=[{**self.patch,'parent':'parent.json','name':'patch'}])
+            with patch.object(repair,'Console') as console, patch('sys.stdout',new=io.StringIO()):
+                console.return_value.command.return_value='Ok, will force load 1 chunk columns'
+                status=repair.execute({'plan_hash':'test','cuboids':[self.parent]},requests,args,work)
+            self.assertEqual(status,0)
+            final=p.read_json(parent_path)
+            self.assertEqual(final['Indices'][:4],self.original['Indices'])
+            self.assertEqual(final['ColumnRepairProvenance']['source_sha256'],backup_hash)
+            self.assertEqual(p.read_json(work/'results.json')['parents']['parent.json']['source_sha256'],backup_hash)
 
 
 if __name__=='__main__':

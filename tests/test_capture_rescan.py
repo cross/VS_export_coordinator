@@ -24,8 +24,9 @@ def data_for(bounds, indices):
 
 
 class FakeConsole:
-    def __init__(self, root, in_band=False, incomplete=False):
+    def __init__(self, root, in_band=False, incomplete=False, normal_indices=None):
         self.root, self.in_band, self.incomplete = root, in_band, incomplete
+        self.normal_indices = normal_indices
         self.commands = []
 
     def command(self, command, expected, timeout=60):
@@ -34,13 +35,17 @@ class FakeConsole:
             values = list(map(int,command.split('/we select ')[1].split()))
             self.bounds = dict(zip(('xmin','ymin','zmin','xmax','ymax','zmax'),values))
         if '/we export ' in command:
-            indices=[x | (z<<10) for z in range(32) for x in range(32)]
+            width=self.bounds['xmax']-self.bounds['xmin']+1
+            depth=self.bounds['zmax']-self.bounds['zmin']+1
+            indices=[x | (z<<10) for z in range(depth) for x in range(width)]
+            if self.bounds['ymin'] > 0 and self.normal_indices is not None:
+                indices=list(self.normal_indices)
             if self.incomplete:
                 indices.pop()
-            if self.in_band:
-                indices.extend([1 | (4<<20), 1 | (4<<20)])
+            if self.in_band and self.bounds['ymin'] == 0:
+                indices.extend([1 | ((4-self.bounds['ymin'])<<20)]*2)
             data=data_for(self.bounds,indices)
-            if self.in_band:
+            if self.in_band and self.bounds['ymin'] == 0:
                 data['BlockIds'][-1]=2
                 data['BlockCodes']['2']='game:water-still-7'
             (self.root/(command.split()[-1]+'.json')).write_text(json.dumps(data))
@@ -58,12 +63,13 @@ class RescanTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.original))
         self.registry={}
 
-    def run_rescan(self, console=None, registry=None):
+    def run_rescan(self, console=None, registry=None, retry_loaded=False):
         console=console or FakeConsole(self.root)
         with patch('sys.stdout',new=io.StringIO()):
             result=rescan.rescan_export(self.path,self.bounds,prefix='test',player='Player',
                 console=console,export_dir=self.root,registry=self.registry if registry is None else registry,
-                save=lambda:None,stable=lambda path:None,archive=coordinator.archive_invalid)
+                save=lambda:None,stable=lambda path:None,archive=coordinator.archive_invalid,
+                retry_loaded=retry_loaded)
         return result,console
 
     def plan(self):
@@ -179,7 +185,7 @@ class RescanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'limits'):
             list(rescan.chunk_bounds([b],0,9000))
 
-    def test_coordinator_rescans_existing_holes_before_retrying_large_selection(self):
+    def test_coordinator_retries_existing_holes_after_loading_before_deeper_scans(self):
         c=coordinator.Cuboid(1,**self.bounds,name='parent')
         log=self.root/'server-main.log'; log.write_text('')
         state=dict(sections={},signature={'prefix':'test'},rescan_settings={'server_log':str(log),'ymin':0})
@@ -206,6 +212,105 @@ class RescanTests(unittest.TestCase):
         self.assertEqual(confirmed['column_presence']['unverified_columns'],0)
         self.assertEqual(len(console.commands),5)
         self.assertTrue(p.read_json(self.path)['ColumnRescanEvidence'])
+
+    def test_empty_first_selection_is_retried_after_loading_without_deeper_scans(self):
+        # Same selection dimensions as the reported new-server failure.
+        self.bounds=dict(xmin=-34600,xmax=-34155,ymin=65,ymax=180,zmin=59275,zmax=59299)
+        self.original=data_for(self.bounds,[])
+        self.original.update(SizeX=1,SizeY=1,SizeZ=1)
+        self.path.write_text(json.dumps(self.original))
+        self.assertEqual(len(list(rescan.chunk_bounds([self.bounds],0,180))),30)
+        result,console=self.run_rescan(retry_loaded=True)
+        self.assertFalse(result['problems'])
+        self.assertEqual(result['column_presence']['observed_columns'],11150)
+        self.assertEqual(result['column_presence']['unverified_columns'],0)
+        self.assertFalse(self.registry['probes'])
+        self.assertEqual(len(console.commands),5)
+        self.assertIn('/we select -34600 65 59275 -34155 180 59299',console.commands[3])
+        self.assertEqual(self.registry['sections']['parent']['restored_columns'],11150)
+
+    def test_deeper_probe_follows_loaded_normal_retry_only_for_persistent_holes(self):
+        console=FakeConsole(self.root,normal_indices=[0,2])
+        result,_=self.run_rescan(console,retry_loaded=True)
+        self.assertEqual(len(console.commands),10)
+        self.assertIn('/we select 0 3 0 2 5 0',console.commands[3])
+        self.assertIn('/we select 0 0 0 31 5 31',console.commands[8])
+        self.assertEqual(result['column_presence']['empty_columns_confirmed_by_rescan'],1)
+        self.assertEqual(result['column_presence']['unverified_columns'],0)
+
+    def test_interruption_keeps_each_probe_in_parent_and_audit_then_resumes(self):
+        for in_band in (False,True):
+            with self.subTest(in_band=in_band), tempfile.TemporaryDirectory() as tmp:
+                self.root=Path(tmp); self.path=self.root/'parent.json'; self.registry={}
+                self.bounds=dict(xmin=0,xmax=63,ymin=3,ymax=5,zmin=0,zmax=0)
+                self.original=data_for(self.bounds,[])
+                self.path.write_text(json.dumps(self.original))
+                original_bytes=self.path.read_bytes()
+                console=FakeConsole(self.root,in_band=in_band,normal_indices=[])
+                command=console.command
+                def interrupt(command_text,*args,**kwargs):
+                    if '/we select 32 0 ' in command_text:
+                        raise KeyboardInterrupt
+                    return command(command_text,*args,**kwargs)
+                console.command=interrupt
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_rescan(console,retry_loaded=True)
+                partial=p.inspect_export(self.path,self.bounds)
+                self.assertFalse(partial['problems'])
+                self.assertEqual(partial['column_presence']['unverified_columns'],32)
+                audit=p.audit_coverage(self.plan(),{},self.root)
+                self.assertEqual(audit['column_presence']['observed_columns'],32)
+                self.assertEqual(audit['column_presence']['missing_columns'],32)
+                self.assertEqual(self.registry['sections']['parent']['status'],'rescanning')
+                self.assertEqual(next(self.root.glob('*.before-rescan-*.json')).read_bytes(),original_bytes)
+                console.command=command
+                previous=len(console.commands)
+                complete,_=self.run_rescan(console,retry_loaded=True)
+                self.assertEqual(complete['column_presence']['unverified_columns'],0)
+                # No repeated normal retry or first probe after restart.
+                self.assertEqual(len(console.commands)-previous,5)
+                self.assertEqual(len(list(self.root.glob('*.before-rescan-*.json'))),1)
+                self.assertEqual(self.registry['sections']['parent']['restored_columns'],2 if in_band else 0)
+
+    def test_old_unapplied_cached_probe_is_applied_before_sending_commands(self):
+        console=FakeConsole(self.root)
+        bounds=next(rescan.chunk_bounds([self.bounds],0,5))
+        ref=rescan.capture_probe(bounds,'old_cached_probe',self.root,'Player',console,
+                                 lambda path:None,coordinator.archive_invalid)
+        self.registry['probes']={p.digest(bounds)[:16]:ref}
+        def no_commands(*args,**kwargs):
+            raise AssertionError('Retained evidence should resolve this without new commands')
+        console.command=no_commands
+        result,_=self.run_rescan(console,retry_loaded=True)
+        self.assertEqual(result['column_presence']['empty_columns_confirmed_by_rescan'],1)
+        self.assertTrue(p.audit_coverage(self.plan(),{},self.root)['column_presence']['complete'])
+
+    def test_ctrl_c_retry_keeps_partial_rescan_parent_instead_of_archiving_it(self):
+        self.bounds=dict(xmin=0,xmax=63,ymin=3,ymax=5,zmin=0,zmax=0)
+        self.path.write_text(json.dumps(data_for(self.bounds,[])))
+        console=FakeConsole(self.root,normal_indices=[])
+        command=console.command
+        interrupted=False
+        def interrupt_once(command_text,*args,**kwargs):
+            nonlocal interrupted
+            if '/we select 32 0 ' in command_text and not interrupted:
+                interrupted=True
+                raise KeyboardInterrupt
+            return command(command_text,*args,**kwargs)
+        console.command=interrupt_once
+        log=self.root/'server-main.log'; log.write_text('')
+        state=dict(sections={},signature={'prefix':'test'},rescan_settings={'server_log':str(log),'ymin':0})
+        c=coordinator.Cuboid(1,**self.bounds,name='parent')
+        def pause(saved,path):
+            self.assertEqual(p.audit_coverage(self.plan(),saved,self.root)['column_presence']['observed_columns'],32)
+        with patch.object(rescan,'Console',return_value=console), patch.object(coordinator,'stable_file',return_value=True), patch.object(coordinator,'pause_after_interrupt',side_effect=pause) as paused, patch.object(coordinator,'run_export_attempt',side_effect=AssertionError('Partial checkpoint must be resumed')), patch('sys.stdout',new=io.StringIO()):
+            pieces,gaps=coordinator.recover_automatically(c,0,'Player','%1',self.root,self.root,
+                state,self.root/'test-progress.json',coordinator.RunStatus([c],state))
+        self.assertEqual(paused.call_count,1)
+        self.assertEqual(pieces,[(c,self.path)])
+        self.assertFalse(gaps)
+        self.assertFalse(list(self.root.glob('*.previous-invalid*.json')))
+        self.assertEqual(state['sections']['parent']['status'],'complete')
 
 
 if __name__=='__main__':

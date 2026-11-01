@@ -226,8 +226,10 @@ def execute(plan, requests, args, work):
         backup = work/'backups'/filename
         if not backup.exists():
             backup.write_bytes(before)
-        elif backup.read_bytes() != before and previous_hash != source_hash:
+        elif (backup.read_bytes() != before and previous_hash != source_hash
+              and results.get('column_rescans', {}).get('sections', {}).get(parent_path.stem, {}).get('sha256') != source_hash):
             raise ValueError('Parent changed since backup; refusing to overlay it again: '+filename)
+        backup_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
         patches = []
         all_valid = True
         below_floor = []
@@ -293,7 +295,7 @@ def execute(plan, requests, args, work):
         if not all_valid:
             checked=corroborate_parent(parent_path,parent,console,args,work,results)
             if not checked['problems'] and not checked['column_presence']['unverified_columns']:
-                results['parents'][filename]={'status':'rescanned','source_sha256':source_hash,
+                results['parents'][filename]={'status':'rescanned','source_sha256':backup_hash,
                     'sha256':checked['sha256'],'backup':str(backup),
                     'column_presence':checked['column_presence']}
                 atomic_json(state_path,results)
@@ -307,13 +309,13 @@ def execute(plan, requests, args, work):
             if confirmed['problems'] or confirmed['column_presence']['unverified_columns']:
                 print('Parent remains unverified:',filename,flush=True)
                 continue
-            results['parents'][filename]={'status':'empty_band_corroborated','source_sha256':source_hash,
+            results['parents'][filename]={'status':'empty_band_corroborated','source_sha256':backup_hash,
                 'sha256':confirmed['sha256'],'backup':str(backup),'below_floor_columns':below_floor}
             atomic_json(state_path,results)
             print('Parent retains original block records; empty bands corroborated by retained deeper evidence:',filename,flush=True)
             continue
         combined['ColumnRepairProvenance'] = {'plan_hash':plan['plan_hash'],
-            'source_sha256':source_hash,'source_backup':str(backup),
+            'source_sha256':backup_hash,'source_backup':str(backup),
             'patches':[{'file':job['name']+'.json','requested':p.box(job)} for job in jobs],
             'repaired_utc':datetime.now(timezone.utc).isoformat()}
         temporary = parent_path.with_suffix('.json.repair-tmp')
@@ -326,7 +328,7 @@ def execute(plan, requests, args, work):
         temporary.replace(parent_path)
         if below_floor:
             checked=corroborate_parent(parent_path,parent,console,args,work,results)
-        results['parents'][filename] = {'status':'repaired','source_sha256':source_hash,
+        results['parents'][filename] = {'status':'repaired','source_sha256':backup_hash,
             'sha256':checked['sha256'],'missing_columns':checked['column_presence']['missing_columns'],
             'below_floor_columns':below_floor,'backup':str(backup)}
         atomic_json(state_path,results)

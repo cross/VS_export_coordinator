@@ -407,7 +407,8 @@ def maybe_rescan_export(c: Cuboid, output_path: Path, player: str, target_pane: 
         # Leave the source intact and fall back to bounded recovery. A deeper
         # export lacking records must never silently bless an unloaded chunk.
         print(f"Deeper rescan unresolved: {exc}")
-        registry.setdefault("sections", {})[c.name] = {"status": "unresolved", "problem": str(exc)}
+        record = registry.setdefault("sections", {}).setdefault(c.name, {})
+        record.update(status="unresolved", problem=str(exc))
         save_state(state_path, state)
 
 
@@ -515,6 +516,14 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
     """Attempt, teleport and retry, then split at most twice before asking."""
     output_path = export_dir / f"{c.name}.json"
     saved = state.get("sections", {}).get(c.name, {})
+    if restart_pending and output_path.exists():
+        checkpoint = state.get("column_rescans", {}).get("sections", {}).get(c.name, {})
+        if checkpoint.get("sha256"):
+            current = capture_plan.inspect_export(output_path, cuboid_record(c))
+            if not current["problems"] and current.get("sha256") == checkpoint["sha256"]:
+                # A completed rescan checkpoint is usable even when the
+                # larger selection was interrupted before reaching complete.
+                restart_pending = False
     if not restart_pending and output_path.exists() and not saved.get("segmented"):
         maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
                             state, state_path, tmux_binary)

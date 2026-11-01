@@ -553,8 +553,9 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
         confirmed_columns = sum(volume(b) // (requested["ymax"] - requested["ymin"] + 1) for b in confirmed)
         result["column_presence"].update(
             empty_columns_confirmed_by_rescan=confirmed_columns,
-            unverified_columns=result["column_presence"]["missing_columns"] - confirmed_columns)
-        if not blocks and not data.get("DecorIndices") and result["column_presence"]["unverified_columns"]:
+            unverified_columns=result["column_presence"]["missing_columns"] - confirmed_columns,
+            unverified_regions=difference(result["column_presence"]["missing_regions"], confirmed))
+        if not blocks and not data.get("DecorIndices") and not confirmed_columns:
             raise ValueError("Empty sparse export cannot establish coverage")
         if "CapturePlanPieces" in data:
             provenance = data["CapturePlanPieces"]

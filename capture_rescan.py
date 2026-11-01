@@ -58,11 +58,12 @@ def chunk_bounds(regions, ymin, ymax):
         yield bounds
 
 
-def capture_probe(bounds, name, export_dir, player, console, stable, archive):
+def capture_loaded_export(bounds, name, export_dir, player, console, stable, archive):
+    """Force-load and retry a selection without touching its source export."""
     response = console.command(
         f"/executeas {player} /chunk forceload {bounds['xmin']} {bounds['zmin']} {bounds['xmax']} {bounds['zmax']}",
         r'will force load \d+ chunk columns')
-    x, z = bounds['xmin'] + 16, bounds['zmin'] + 16
+    x, z = (bounds['xmin'] + bounds['xmax']) // 2, (bounds['zmin'] + bounds['zmax']) // 2
     console.command(f"/tp {player} {x} {bounds['ymax']-2} {z}", r'teleported')
     deadline = time.monotonic() + 90
     while True:
@@ -81,11 +82,33 @@ def capture_probe(bounds, name, export_dir, player, console, stable, archive):
     console.command(f'/executeas {player} /we export {name}', r'\d+ blocks.*exported', 120)
     stable(path)
     evidence = p.inspect_export(path, bounds, allow_rescans=False)
-    if evidence['problems'] or evidence['column_presence']['missing_columns']:
-        raise ValueError('Deeper rescan still lacks complete column presence: ' + name)
-    return {'file': path.name, 'requested': bounds, 'sha256': evidence['sha256'],
+    if evidence['problems'] and evidence['problems'] != ['Empty sparse export cannot establish coverage']:
+        raise ValueError('Loaded export failed validation: ' + name + ': ' + '; '.join(evidence['problems']))
+    return {'file': path.name, 'requested': bounds, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
             'load_check': {'force_loaded': True, 'queues_clear': True,
                            'preload_response': response, 'queue_response': queues}}
+
+
+def capture_probe(bounds, name, export_dir, player, console, stable, archive):
+    ref = capture_loaded_export(bounds, name, export_dir, player, console, stable, archive)
+    evidence = p.inspect_export(export_dir / ref['file'], bounds, allow_rescans=False)
+    if evidence['problems'] or evidence['column_presence']['missing_columns']:
+        raise ValueError('Deeper rescan still lacks complete column presence: ' + name)
+    return ref
+
+
+def usable_loaded_export(ref, export_dir, bounds):
+    """An acknowledged normal-height retry may legitimately still be empty."""
+    if not ref or ref.get('requested') != bounds:
+        return False
+    if not isinstance(ref.get('file'), str) or Path(ref['file']).name != ref['file']:
+        return False
+    path = export_dir / ref['file']
+    evidence = p.inspect_export(path, bounds, allow_rescans=False)
+    return (not evidence['problems'] or evidence['problems'] == ['Empty sparse export cannot establish coverage']) and (
+        hashlib.sha256(path.read_bytes()).hexdigest() == ref.get('sha256')
+        and ref.get('load_check', {}).get('force_loaded') is True
+        and ref.get('load_check', {}).get('queues_clear') is True)
 
 
 def usable_probe(ref, export_dir, bounds):
@@ -147,69 +170,133 @@ def fill_missing_columns(original, requested, probes):
 
 
 def rescan_export(path, requested, *, prefix, player, console, export_dir,
-                  registry, save, stable, archive, ymin=0):
-    """Resolve missing columns with chunk probes, preserving original bytes."""
+                  registry, save, stable, archive, ymin=0, retry_loaded=True):
+    """Reuse saved probes, retry after loading, then checkpoint each deeper probe."""
     evidence = p.inspect_export(path, requested)
-    missing = evidence.get('column_presence', {}).get('unverified_columns',
-                         evidence.get('column_presence', {}).get('missing_columns', 0))
+    columns = evidence.get('column_presence', {})
+    missing = columns.get('unverified_columns', columns.get('missing_columns', 0))
     soft_error = ['Empty sparse export cannot establish coverage']
     if not missing or (evidence['problems'] and evidence['problems'] != soft_error):
         return evidence
-    if ymin >= requested['ymin']:
-        raise ValueError('Rescan Y minimum must be below the selection floor')
-    original_bytes = path.read_bytes()
-    original = json.loads(original_bytes)
-    if original.get('CapturePlanPieces'):
+    print(f"{path.stem}: {missing:,} unverified X/Z columns out of "
+          f"{columns['requested_columns']:,}.", flush=True)
+    current_bytes = path.read_bytes()
+    current = json.loads(current_bytes)
+    if current.get('CapturePlanPieces'):
         raise ValueError('Rescan source leaves rather than a merged parent')
+    source_hash = hashlib.sha256(current_bytes).hexdigest()
+    backup = path.with_name(path.stem + '.before-rescan-' + source_hash[:12] + '.json')
     refs = {}
     cache = registry.setdefault('probes', {})
-    old_metadata = original.get('ColumnRescanEvidence', {})
-    if isinstance(old_metadata, dict) and isinstance(old_metadata.get('probes'), list):
-        for ref in old_metadata['probes']:
-            try:
-                bounds = p.box(ref['requested'])
-                if usable_probe(ref, export_dir, bounds):
-                    cache[p.digest(bounds)[:16]] = ref
-            except (KeyError, TypeError, ValueError):
-                pass
-    for bounds in chunk_bounds(evidence['column_presence']['missing_regions'], ymin, requested['ymax']):
+    old_metadata = current.get('ColumnRescanEvidence', {})
+    if isinstance(old_metadata, dict):
+        old_backup = old_metadata.get('source_backup')
+        if isinstance(old_backup, str) and Path(old_backup).name == old_backup:
+            candidate = path.parent / old_backup
+            if candidate.is_file() and hashlib.sha256(candidate.read_bytes()).hexdigest() == old_metadata.get('source_sha256'):
+                backup, source_hash = candidate, old_metadata['source_sha256']
+        if isinstance(old_metadata.get('probes'), list):
+            for ref in old_metadata['probes']:
+                try:
+                    bounds = p.box(ref['requested'])
+                    if usable_probe(ref, export_dir, bounds):
+                        cache[p.digest(bounds)[:16]] = ref
+                        refs[ref['file']] = ref
+                except (KeyError, TypeError, ValueError):
+                    pass
+    prior = registry.get('sections', {}).get(path.stem, {})
+    restored = prior.get('restored_columns', 0) if prior.get('sha256') == hashlib.sha256(current_bytes).hexdigest() else 0
+    loaded_ref = None
+
+    def remaining():
+        columns = evidence.get('column_presence', {})
+        return columns.get('unverified_columns', columns.get('missing_columns', 0))
+
+    def checkpoint(ref, deeper):
+        nonlocal current_bytes, current, evidence, restored
+        bounds = ref['requested']
+        combined, added = fill_missing_columns(current, requested, [(bounds, p.read_json(export_dir/ref['file']))])
+        if deeper:
+            refs[ref['file']] = ref
+        if not added and not deeper:
+            return
+        metadata = {'version': 1, 'probes': list(refs.values()),
+            'source_sha256': source_hash, 'source_backup': backup.name,
+            'entity_policy': 'Original entities retained; additional entity observations remain in raw export files.'}
+        if loaded_ref:
+            metadata['loaded_retry'] = loaded_ref
+        elif isinstance(old_metadata, dict) and old_metadata.get('loaded_retry'):
+            metadata['loaded_retry'] = old_metadata['loaded_retry']
+        combined['ColumnRescanEvidence'] = metadata
+        temporary = path.with_suffix('.json.rescan-tmp')
+        temporary.write_text(json.dumps(combined, separators=(',', ':')))
+        checked = p.inspect_export(temporary, requested)
+        if checked['problems']:
+            temporary.unlink()
+            raise ValueError('Rescanned export failed validation: ' + '; '.join(checked['problems']))
+        if path.read_bytes() != current_bytes:
+            temporary.unlink()
+            raise ValueError('Export changed during rescan; refusing replacement')
+        if not backup.exists():
+            backup.write_bytes(current_bytes)
+        elif hashlib.sha256(backup.read_bytes()).hexdigest() != source_hash:
+            temporary.unlink()
+            raise ValueError('Rescan backup hash conflict')
+        temporary.replace(path)
+        current_bytes, current = path.read_bytes(), combined
+        checked['file'] = str(path)
+        evidence = checked
+        restored += added
+        registry.setdefault('sections', {})[path.stem] = {
+            'status': 'rescanning' if remaining() else 'resolved',
+            'sha256': checked['sha256'], 'source_backup': backup.name,
+            'restored_columns': restored,
+            'empty_columns_confirmed_by_rescan': checked['column_presence']['empty_columns_confirmed_by_rescan'],
+            'unverified_columns': remaining(), 'probes': list(refs.values())}
+        save()
+        print(f"Saved rescan checkpoint: +{added:,} columns restored; "
+              f"{checked['column_presence']['empty_columns_confirmed_by_rescan']:,} empty bands corroborated; "
+              f"{remaining():,} unverified.", flush=True)
+
+    # Older versions cached probes before applying the batch. Recover those
+    # files first, so upgrading/resuming does not throw away completed work.
+    if ymin < requested['ymin']:
+        for bounds in chunk_bounds(columns.get('unverified_regions', columns['missing_regions']), ymin, requested['ymax']):
+            ref = cache.get(p.digest(bounds)[:16])
+            if usable_probe(ref, export_dir, bounds):
+                print(f"Applying retained deeper export: {ref['file']}", flush=True)
+                checkpoint(ref, True)
+    if not remaining():
+        return evidence
+
+    if retry_loaded:
+        token = p.digest(requested)[:16]
+        retries = registry.setdefault('loaded_retries', {})
+        loaded_ref = retries.get(token)
+        if not usable_loaded_export(loaded_ref, export_dir, requested):
+            print('Loading the selection and retrying at the requested Y bounds before deeper scans.', flush=True)
+            loaded_ref = capture_loaded_export(requested, prefix + '_loaded_' + token,
+                export_dir, player, console, stable, archive)
+            retries[token] = loaded_ref
+            save()
+        checkpoint(loaded_ref, False)
+        if not remaining():
+            return evidence
+
+    if ymin >= requested['ymin']:
+        raise ValueError('Rescan Y minimum must be below the selection floor')
+    columns = evidence['column_presence']
+    planned = list(chunk_bounds(columns.get('unverified_regions', columns['missing_regions']), ymin, requested['ymax']))
+    print(f"After loading/retry: {remaining():,} columns still unverified; "
+          f"checking {len(planned)} affected chunk columns for deeper evidence.", flush=True)
+    for index, bounds in enumerate(planned, 1):
         token = p.digest(bounds)[:16]
         ref = cache.get(token)
         if not usable_probe(ref, export_dir, bounds):
-            print(f"Deeper rescan: X {bounds['xmin']}..{bounds['xmax']}, Z {bounds['zmin']}..{bounds['zmax']}, Y {ymin}..{bounds['ymax']}", flush=True)
+            print(f"Deeper rescan {index}/{len(planned)}: X {bounds['xmin']}..{bounds['xmax']}, "
+                  f"Z {bounds['zmin']}..{bounds['zmax']}, Y {ymin}..{bounds['ymax']}", flush=True)
             ref = capture_probe(bounds, prefix + '_depth_' + token, export_dir, player, console, stable, archive)
             cache[token] = ref
             save()
-        refs[ref['file']] = ref
-    probes = [(ref['requested'], p.read_json(export_dir/ref['file'])) for ref in refs.values()]
-    combined, restored = fill_missing_columns(original, requested, probes)
-    combined['ColumnRescanEvidence'] = {'version': 1, 'probes': list(refs.values()),
-        'source_sha256': hashlib.sha256(original_bytes).hexdigest(),
-        'source_backup': path.stem + '.before-rescan-' + hashlib.sha256(original_bytes).hexdigest()[:12] + '.json',
-        'entity_policy': 'Original entities retained; additional entity observations remain in raw probe files.'}
-    temporary = path.with_suffix('.json.rescan-tmp')
-    temporary.write_text(json.dumps(combined, separators=(',', ':')))
-    checked = p.inspect_export(temporary, requested)
-    if checked['problems']:
-        temporary.unlink()
-        raise ValueError('Rescanned export failed validation: ' + '; '.join(checked['problems']))
-    if path.read_bytes() != original_bytes:
-        temporary.unlink()
-        raise ValueError('Export changed during rescan; refusing replacement')
-    backup = path.with_name(path.stem + '.before-rescan-' + hashlib.sha256(original_bytes).hexdigest()[:12] + '.json')
-    if backup.exists() and backup.read_bytes() != original_bytes:
-        raise ValueError('Rescan backup hash conflict')
-    if not backup.exists():
-        backup.write_bytes(original_bytes)
-    temporary.replace(path)
-    registry.setdefault('sections', {})[path.stem] = {
-        'sha256': checked['sha256'], 'source_backup': backup.name,
-        'restored_columns': restored,
-        'empty_columns_confirmed_by_rescan': checked['column_presence']['empty_columns_confirmed_by_rescan'],
-        'unverified_columns': checked['column_presence']['unverified_columns'],
-        'probes': list(refs.values())}
-    save()
-    print(f"Rescan result: {restored} columns restored; "
-          f"{checked['column_presence']['empty_columns_confirmed_by_rescan']} empty bands corroborated; "
-          f"{checked['column_presence']['unverified_columns']} unverified.", flush=True)
-    return checked
+        checkpoint(ref, True)
+    return evidence
