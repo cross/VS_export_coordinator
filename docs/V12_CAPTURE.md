@@ -74,7 +74,9 @@ is retained through retries and subdivisions.
 
 Each plan uses its own hash-derived prefix, `<prefix>-progress.json`, command
 directory, and execution coverage checkpoint beside `plan.json`. Reports write
-`<prefix>-audit.json` and `<prefix>-coverage.svg`. The audit JSON lists every
+`<prefix>-audit.json`, `<prefix>-coverage.svg`, and `<prefix>-columns.svg`.
+The columns preview highlights only X/Z columns still unverified, while the
+coverage preview also includes vertical gaps. The audit JSON lists every
 exact uncovered cuboid, per-file validation problems and SHA256 values, and
 ceiling warnings. It re-reads the exports instead of trusting a saved complete
 status or the current coastline source. Exit codes: 0 means the requested 3D
@@ -158,11 +160,150 @@ and extra edge terrain is allowed. The independent audit computes requested minu
 coverage. Missing, unreadable, malformed, empty, or out-of-bounds export records
 receive no credit. A shortened SizeY never silently establishes empty air.
 
+Each file also has a `column_presence` result counting requested, observed,
+and missing X/Z columns, with exact `missing_regions`. A column is observed
+when at least one block or decor record exists at any returned height.
+Columns without records or corroborating deeper-rescan evidence are removed
+from credited envelopes even when the file's SizeX/SizeZ spans them.
+The report's top-level `column_presence` checks
+the union against the requested footprint; per-file results include the extra
+padding in each selection. Missing files and invalid files receive no credit.
+A positive column check does not prove every height in that column loaded.
+
+Collection validation rejects unverified columns. A column consisting entirely
+of air within the requested Y band triggers an automatic deeper rescan, as
+described below, instead of repeatedly subdividing the same air space.
+
 This proof is conditional on WorldEdit accurately reporting exported extents
 and contents. Sparse JSON alone cannot establish chunk residency or distinguish
 all missing terrain from intentionally omitted air. It also cannot establish a
 single simultaneous world snapshot across separate captures. The audit records
 these evidence limits rather than claiming stronger verification.
+
+## Automatic deeper rescans
+
+Normal collection keeps the saved plan's initial Y bounds (currently 65–180).
+When a direct export has columns without any block/decor records, the
+coordinator automatically groups them by 32-by-32 chunk columns and exports
+each affected chunk from Y=0 through that selection's requested ceiling.
+This happens before the usual teleport/retry/subdivision recovery. Existing
+exports with holes also take this path on resume. Multiple holes and neighboring
+selections reuse the same validated probe when its bounds match.
+
+Each fresh probe requests `/executeas PLAYER /chunk forceload ...`, waits for
+its acknowledgement, teleports the player into that chunk, and queries
+`/executeas PLAYER /chunk cit` until both queues report false. It then selects
+and exports the deeper area, validates its format, and requires a block/decor
+record in every probe column. It does not accept a queue response alone.
+Probe failures remain unverified and fall back to bounded collection recovery.
+Forced columns remain loaded until server restart; the coordinator does not
+restart the server. In step-by-step mode, deeper recovery commands follow
+automatically after the initial export confirmation.
+
+The coordinator reads acknowledgements from `../Logs/server-main.log` relative
+to the WorldEdit export directory. Override it for a different layout:
+
+```sh
+python3 -B vintage_story_export_coordinator.py \
+  --target-pane PANE --export-dir /absolute/path/to/WorldEdit \
+  --server-log /absolute/path/to/Logs/server-main.log
+```
+
+`--rescan-y-min 0` is the default. A different lower bound must be below the
+selection floor and keep the probe within selection limits. It changes only
+diagnostic probes, not the saved plan or its horizontal footprint. If the log
+cannot be read, empty columns stay unverified; the printed message identifies
+the path needed for `--server-log`. Preview and reporting never send commands.
+
+A deeper probe can yield three outcomes:
+
+- **In-band records recovered:** records at the requested Y heights are added
+  only to previously empty parent columns. Existing records and both block
+  layers are preserved; records below the requested floor remain in the probe.
+- **Empty band corroborated:** every probe column has records, but the highest
+  record in an affected column is below the requested floor. The retained
+  deeper export and load acknowledgements corroborate the empty band. No air
+  blocks are invented, and that column no longer triggers repeated retries.
+- **Still unverified:** invalid output, empty probe columns, failed commands,
+  or missing acknowledgements cannot establish the empty-band result.
+
+Before changing a parent, the coordinator saves its exact original bytes as
+`NAME.before-rescan-HASH.json` in the export directory. Replacement is atomic.
+The parent includes `ColumnRescanEvidence` containing probe filenames, bounds,
+SHA256 values, load responses, and its backup reference. The progress file's
+`column_rescans` records cached probes and per-section results; commands and
+responses are under `<prefix>-commands/rescans/`. Probe filenames begin with
+`<prefix>_depth_`. Keep the parent, referenced probes, and source backups.
+Original entity blobs remain in parents; any additional probe entities remain
+in the raw probe rather than being merged without entity identity checks.
+
+Reporting revalidates and hashes referenced probes, so saved success alone
+cannot establish coverage. Missing, changed, or invalid probe files revoke
+their empty-band credit; the next collection run can capture new evidence.
+Per-file `column_presence.missing_columns` retains the raw no-record count,
+`empty_columns_confirmed_by_rescan` counts corroborated bands, and
+`unverified_columns` counts the remaining unknowns. At report level,
+`columns_without_direct_records` retains the raw deficit and `missing_columns`
+counts unverified columns after all sources are considered. Full-height credit
+for a corroborated empty band is conditional on WorldEdit correctly returning
+loaded contents; this is operational evidence, not a block-by-block air listing.
+Other trimmed-height gaps remain visible in the ordinary 3D report.
+
+## Repair reported empty columns
+
+`tools/recapture_columns.py` is an operational repair utility for reports in
+the independent audit's format. The report must contain the matching
+`plan_hash`, `empty_columns` total, and `empty_column_rectangles` entries with
+`file`, `xmin`, `xmax`, `zmin`, `zmax`, and `columns`. Bounds must lie inside
+their named plan units and reported rectangles must not overlap.
+
+Prepare a reviewable request without contacting the server:
+
+```sh
+python3 -B tools/recapture_columns.py \
+  --report /absolute/path/to/independent-audit.json \
+  --export-dir /absolute/path/to/WorldEdit \
+  --work-dir repairs/coastal-connection-repair
+```
+
+Review `requests.json` in that work directory. To execute the same request,
+add `--execute --target-pane PANE --player PLAYER`, plus
+`--server-log /absolute/path/to/Logs/server-main.log`. If needed, add
+`--tmux-binary /absolute/path/to/tmux`. Do not run another collector or change
+the same player's WorldEdit selection while this utility runs.
+
+The utility requests `/chunk forceload` for the reported regions, then uses
+patches no larger than 128 X by 32 Z blocks at the plan's Y bounds. Each fresh
+patch gets a teleport and `/executeas PLAYER /chunk cit` queue check before
+selection/export. A queue check alone is insufficient; returned JSON must
+also pass the column check. Forced chunk columns remain pinned until the
+server restarts. The utility does not restart the server.
+
+A persistent completely empty patch uses the same deeper-probe machinery as
+normal collection. Probes are reused for nearby tiny holes. The utility records
+below-floor observations and attaches retained evidence to the parent before
+declaring its empty band corroborated. It does not fabricate air records or
+alter the plan's Y bounds.
+
+`results.json` records patch status, bounds, hashes, deeper observations, and
+parent replacements. `commands/` retains commands and server responses;
+`backups/` holds byte-for-byte parent originals. Repair and probe exports
+remain in the WorldEdit directory. Resuming with the same arguments reuses
+validated patches and unchanged completed parents.
+
+Only previously empty columns are overlaid into a parent, preserving its
+existing block/decor records and both block layers. Parent replacement is
+atomic and includes `ColumnRepairProvenance`; unresolved parents stay
+unchanged. Original entity blobs remain in parents; additional patch entities
+are retained in patch files rather than merged without entity identity
+checks. Synthetic merged parents must be repaired through their source leaves
+instead; this utility refuses to overlay them.
+
+`results.json`'s `complete` is recomputed from fresh parent validation and
+requires no unverified columns. Corroborated empty bands can satisfy that check.
+Run the normal coverage audit after repair to refresh the report and both
+previews. It can still report unverified columns or trimmed height; those
+limitations remain visible.
 
 ## Generate or revise a plan
 
@@ -426,9 +567,10 @@ Tests include exact subtraction against a voxel oracle, independent high
 precision curve inversion, all three mouth/gap transitions and buffer ends,
 selection limits, disjoint partitions, hash integrity, lake inclusion, height
 extensions, corrupt exports, ceiling flags, shortened Y, merged-leaf height
-gaps, and offline coordinator reporting. They do not contact a server.
+gaps, exact internal column holes, decor presence, repair overlays, and offline
+coordinator reporting. They do not contact a server.
 
-The guide is in `docs/`, tests are in `tests/`, and the two application modules
+The guide is in `docs/`, tests are in `tests/`, repair utilities are in `tools/`, and the application modules
 remain at the repository root. The plan JSON, coastline input, and changelog
 belong together in `capture-plans/coastal-connection/`. Generated previews,
 commands, progress files, coverage reports, and temporary files are ignored by

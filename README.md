@@ -20,10 +20,17 @@ Repository layout:
   currently defaults to `capture-plans/coastal-connection/plan.json`
 - `v12_capture_plan.py`: planning, previews, and independent coverage auditing.
   Imported by `vintage_story_export_coordinator.py`
+- `capture_rescan.py`: automatic chunk-sized deeper exports for empty columns,
+  with acknowledged loading, repairs, and retained audit evidence.
 - `capture-plans/coastal-connection/`: current plan, coastline input, and
   changelog; Git retains earlier plan revisions.
 - `docs/`: operating instructions and design information.
 - `tests/`: automated tests using simulated exports; no server is contacted.
+- `tools/recapture_columns.py`: targeted repair utility for an independent
+  empty-column report; see [repair instructions](docs/V12_CAPTURE.md#repair-reported-empty-columns).
+
+Normal collection automatically rescans empty columns at deeper Y levels;
+see [automatic deeper rescans](docs/V12_CAPTURE.md#automatic-deeper-rescans).
 
 Run the tests from the repository root:
 

@@ -13,8 +13,15 @@ __pycache__/
 *-coverage.json
 *-audit.json
 *-coverage.svg
+*-columns.svg
 *.json.tmp
 *.previous-invalid*.json
 
 # Optional dedicated directory for collected world exports
 /exports/
+
+# Local repair jobs, source backups, and server response records
+/repairs/
+*.json.repair-tmp
+*.json.rescan-tmp
+*.before-rescan-*.json

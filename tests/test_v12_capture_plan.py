@@ -21,7 +21,9 @@ def voxels(boxes):
 def export_data(b, size_y=None, ceiling=False):
     sx, sy, sz = [b[a+'max'] - b[a+'min'] + 1 for a in p.AXES]
     sy = size_y or sy
-    indices = [0]
+    # A valid terrain fixture has at least one record in every requested X/Z
+    # column; additional height can still be sparse.
+    indices = [x | (z << 10) for z in range(sz) for x in range(sx)]
     if ceiling and sy > 1:
         indices.append((sy-1) << 20)
     return dict(SizeX=sx, SizeY=sy, SizeZ=sz,
@@ -315,9 +317,11 @@ class EvidenceTests(unittest.TestCase):
 
     def test_solid_fluid_pairs_preserve_distinct_water_codes(self):
         data = export_data(self.b)
-        data.update(Indices=[0, 0, 1, 1], BlockIds=[1, 2, 3, 4],
-                    BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7',
-                                '3': 'game:rock-peridotite', '4': 'game:water-still-7'})
+        data['BlockIds'][1] = 3
+        data['Indices'].extend([0, 1])
+        data['BlockIds'].extend([2, 4])
+        data['BlockCodes'] = {'1': 'game:seaweed-section', '2': 'game:saltwater-still-7',
+                              '3': 'game:rock-peridotite', '4': 'game:water-still-7'}
         evidence = self.inspect(data)
         self.assertFalse(evidence['problems'])
         self.assertEqual(evidence['layered_positions'], 2)
@@ -327,8 +331,9 @@ class EvidenceTests(unittest.TestCase):
 
     def test_resume_can_use_valid_parent_instead_of_old_failed_splits(self):
         data = export_data(self.b)
-        data.update(Indices=[0, 0], BlockIds=[1, 2],
-                    BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7'})
+        data['Indices'].append(0)
+        data['BlockIds'].append(2)
+        data['BlockCodes']['2'] = 'game:saltwater-still-7'
         self.inspect(data)
         c = coordinator.Cuboid(1, **self.b, name='piece')
         previous = {'segmented': True, 'status': 'partial', 'children': [{'name': 'missing'}],
@@ -361,16 +366,44 @@ class EvidenceTests(unittest.TestCase):
         for name, bounds in (('left', {**self.b, 'xmax': -1}), ('right', {**self.b, 'xmin': 0})):
             c = coordinator.Cuboid(1, **bounds, name=name)
             data = export_data(bounds)
-            data.update(Indices=[0, 0], BlockIds=[1, 2],
-                        BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7'})
+            data['Indices'].append(0)
+            data['BlockIds'].append(2)
+            data['BlockCodes']['2'] = 'game:saltwater-still-7'
             path = directory/(name+'.json')
             path.write_text(json.dumps(data))
             pieces.append((c, path))
         coordinator.merge_exports(parent, pieces, self.path)
         merged = json.loads(self.path.read_text())
-        self.assertEqual(merged['Indices'], [0, 0, 5, 5])
-        self.assertEqual(merged['BlockIds'], [1, 2, 1, 2])
+        self.assertEqual([b for i,b in zip(merged['Indices'],merged['BlockIds']) if i == 0], [1, 2])
+        self.assertEqual([b for i,b in zip(merged['Indices'],merged['BlockIds']) if i == 5], [1, 2])
         self.assertFalse(coordinator.validate_export(self.path, parent))
+
+    def test_internal_column_holes_are_exact_and_excluded_from_audit(self):
+        data = export_data(self.b)
+        missing = {(2,3),(3,3),(2,4),(3,4)}
+        pairs = [(i,b) for i,b in zip(data['Indices'],data['BlockIds'])
+                 if (i & 1023, (i >> 10) & 1023) not in missing]
+        data['Indices'],data['BlockIds'] = map(list,zip(*pairs))
+        evidence = self.inspect(data)
+        self.assertFalse(evidence['problems'])
+        self.assertEqual(evidence['column_presence']['missing_columns'],4)
+        self.assertEqual(evidence['column_presence']['missing_regions'],
+            [dict(xmin=-3,xmax=-2,ymin=65,ymax=180,zmin=7,zmax=8)])
+        c = coordinator.Cuboid(1,**self.b,name='piece')
+        self.assertTrue(any('4 X/Z columns' in e for e in coordinator.validate_export(self.path,c)))
+        plan = dict(cuboids=[{**self.b,'name':'piece'}],requests=[self.b],
+                    world_center=p.WORLD_CENTER,plan_hash='test',geometry_hash='test')
+        audit = p.audit_coverage(plan,{},Path(self.temp.name))
+        self.assertEqual(audit['column_presence']['missing_columns'],4)
+        self.assertEqual(audit['requested_blocks']-audit['verified_envelope_blocks'],4*116)
+
+    def test_decor_counts_as_column_presence_without_a_block_record(self):
+        data = export_data(self.b)
+        data['Indices'].pop()
+        data['BlockIds'].pop()
+        data['DecorIndices'] = [9 | (9 << 10)]
+        data['DecorIds'] = [1]
+        self.assertEqual(self.inspect(data)['column_presence']['missing_columns'],0)
 
     def test_oversized_merge_rejected_before_writing(self):
         c = coordinator.Cuboid(1, 0, 1023, 0, 5, 0, 5, 'too_wide')

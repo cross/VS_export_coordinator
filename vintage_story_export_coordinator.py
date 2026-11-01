@@ -2,8 +2,10 @@
 # vim:et sts=4 sw=4
 """Collect and verify Vintage Story WorldEdit exports from a saved coastline plan.
 
-The saved plan is the only source of selection bounds, heights, and export
-names. The default is capture-plans/coastal-connection/plan.json beside this
+The saved plan defines the normal selection bounds, heights, and export
+names. Empty columns can trigger retained, chunk-sized deeper diagnostic
+exports without changing the plan. The default plan is
+capture-plans/coastal-connection/plan.json beside this
 script; v12_capture_plan.py creates and revises that specification.
 This program never edits terrain. It writes `/we select` and `/we export`
 commands to a file, pastes them to the confirmed tmux pane, then watches the
@@ -28,6 +30,7 @@ import time
 from typing import Any
 
 import v12_capture_plan as capture_plan
+import capture_rescan
 
 
 WORLD_CENTER = capture_plan.WORLD_CENTER
@@ -191,10 +194,6 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
         return ["Export root is not an object"]
 
     expected = expected_export(c)
-    for key in ("SizeX", "SizeZ"):
-        actual = data.get(key)
-        if actual != expected[key]:
-            problems.append(f"{key} is {actual!r}; expected {expected[key]}")
     size_y = data.get("SizeY")
     if not isinstance(size_y, int) or not 1 <= size_y <= expected["SizeY_max"]:
         problems.append(f"SizeY is {size_y!r}; expected 1..{expected['SizeY_max']} (empty upper space may be omitted)")
@@ -211,12 +210,15 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
         problems.append("Indices or BlockIds is missing or is not an array")
     elif len(indices) != len(block_ids):
         problems.append(f"Indices has {len(indices)} entries but BlockIds has {len(block_ids)}")
-    elif not indices:
-        problems.append("Export contains no block entries; completeness cannot be established")
     for key in ("DecorIndices", "DecorIds"):
         if key in data and not isinstance(data[key], list):
             problems.append(f"{key} is not an array")
-    problems.extend(capture_plan.inspect_export(path, cuboid_record(c))["problems"])
+    evidence = capture_plan.inspect_export(path, cuboid_record(c))
+    problems.extend(evidence["problems"])
+    columns = evidence.get("column_presence", {})
+    missing = columns.get("unverified_columns", columns.get("missing_columns", 0))
+    if missing:
+        problems.append(f"{missing} X/Z columns have no block/decor record at any returned height; column coverage is unverified")
     return problems
 
 
@@ -225,13 +227,16 @@ def validated_export_record(c: Cuboid, path: Path, previous: dict | None = None)
     evidence = capture_plan.inspect_export(path, cuboid_record(c))
     if evidence["problems"] or evidence["covered"] is None:
         raise ValueError("Cannot checkpoint an invalid export: " + "; ".join(evidence["problems"]))
+    if evidence.get("column_presence", {}).get("unverified_columns"):
+        raise ValueError("Cannot checkpoint an export with unverified empty columns")
     # Keep evidence for a locally merged file: its envelope must not conceal a
     # missing upper layer in an individual piece. Direct WorldEdit files can
     # supersede the recovery tree that the earlier validator created for them.
     retained = previous if previous and previous.get("merged") else {}
     record = {**retained, "status": "complete", "file": str(path),
               "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-              "returned_bounds": evidence["covered"], "ceiling_blocks": evidence["ceiling_blocks"]}
+              "returned_bounds": evidence["covered"], "ceiling_blocks": evidence["ceiling_blocks"],
+              "column_presence": evidence["column_presence"]}
     if evidence.get("pieces"):
         pieces = [{**item, "file": str(path.parent / Path(item["file"]).name)} for item in evidence["pieces"]]
         record.update(merged=True, segmented=True, piece_regions=pieces,
@@ -375,6 +380,37 @@ def paste_commands(command_path: Path, target_pane: str, tmux_binary: str = "tmu
                     "paste-buffer", "-d", "-t", target_pane], check=True)
 
 
+def maybe_rescan_export(c: Cuboid, output_path: Path, player: str, target_pane: str,
+                        command_dir: Path, export_dir: Path, state: dict, state_path: Path,
+                        tmux_binary: str) -> None:
+    """Probe empty columns only during collection, with acknowledged loading."""
+    evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
+    columns = evidence.get("column_presence", {})
+    if not columns.get("unverified_columns", columns.get("missing_columns", 0)):
+        return
+    settings = state.get("rescan_settings", {})
+    logfile = Path(settings.get("server_log") or export_dir.parent / "Logs" / "server-main.log")
+    if not logfile.is_file():
+        print(f"Cannot verify chunk loading for deeper rescan: server log unavailable at {logfile}. Use --server-log.")
+        return
+    registry = state.setdefault("column_rescans", {"version": 1, "probes": {}, "sections": {}})
+    console = capture_rescan.Console(tmux_binary, target_pane, logfile,
+                                    command_dir / "rescans", paste_commands)
+    try:
+        capture_rescan.rescan_export(
+            output_path, cuboid_record(c), prefix=state.get("signature", {}).get("prefix", c.name),
+            player=player, console=console, export_dir=export_dir, registry=registry,
+            save=lambda: save_state(state_path, state),
+            stable=lambda path: stable_file(path, lambda: False), archive=archive_invalid,
+            ymin=settings.get("ymin", 0))
+    except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
+        # Leave the source intact and fall back to bounded recovery. A deeper
+        # export lacking records must never silently bless an unloaded chunk.
+        print(f"Deeper rescan unresolved: {exc}")
+        registry.setdefault("sections", {})[c.name] = {"status": "unresolved", "problem": str(exc)}
+        save_state(state_path, state)
+
+
 def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Path,
                        export_dir: Path, state: dict[str, Any], state_path: Path,
                        confirm: bool = True, verbose: bool = True,
@@ -408,6 +444,8 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
         print(f"Waiting for a stable export for {region_label(c)}.")
     if not stable_file(output_path, lambda: False):
         raise KeyboardInterrupt
+    maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
+                        state, state_path, tmux_binary)
     problems = validate_export(output_path, c)
     if problems:
         state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
@@ -419,7 +457,8 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
                                  "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
     state["sections"][c.name].update(returned_bounds=evidence["covered"],
-                                     ceiling_blocks=evidence["ceiling_blocks"])
+                                     ceiling_blocks=evidence["ceiling_blocks"],
+                                     column_presence=evidence["column_presence"])
     short_height = evidence["covered"] and evidence["covered"]["ymax"] < c.ymax
     if not confirm and not verbose:
         print("export validated" + (" (height trimmed)" if short_height else ""))
@@ -476,6 +515,9 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
     """Attempt, teleport and retry, then split at most twice before asking."""
     output_path = export_dir / f"{c.name}.json"
     saved = state.get("sections", {}).get(c.name, {})
+    if not restart_pending and output_path.exists() and not saved.get("segmented"):
+        maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
+                            state, state_path, tmux_binary)
     if not restart_pending and output_path.exists() and not validate_export(output_path, c):
         state["sections"][c.name] = validated_export_record(c, output_path, saved)
         save_state(state_path, state)
@@ -797,15 +839,20 @@ def prompt_value(label: str, default: str) -> str:
 
 
 def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path) -> int:
-    report = capture_plan.audit_coverage(plan, state, export_dir)
+    report = capture_plan.audit_coverage(plan, state, export_dir, progress=capture_plan.audit_progress)
     path = plan_path.with_name(plan["prefix"] + "-audit.json")
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(report, indent=2) + "\n")
     tmp.replace(path)
     capture_plan.render_preview(plan, plan_path.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
+    capture_plan.render_column_preview(plan, report, plan_path.with_name(plan["prefix"] + "-columns.svg"))
     print(f"Verified reported 3D coverage: {report['coverage_percent']:.6f}% "
           f"({report['verified_envelope_blocks']:,}/{report['requested_blocks']:,} positions).")
     print(f"Exact uncovered regions: {len(report['gaps'])}. Audit: {path}")
+    columns = report["column_presence"]
+    print(f"Column evidence: {columns['observed_columns']:,}/{columns['requested_columns']:,}; "
+          f"{columns['missing_columns']:,} unverified; "
+          f"{columns['empty_columns_confirmed_by_rescan']:,} empty bands corroborated by deeper rescans.")
     for warning in report["warnings"]:
         print(f"Height/coverage warning: {warning}")
     print(report["evidence_limits"])
@@ -826,6 +873,10 @@ def main() -> int:
     parser.add_argument("--report-coverage", action="store_true",
                         help="revalidate exports and report exact X/Y/Z coverage without sending commands")
     parser.add_argument("--verbose", action="store_true", help="print bounds and validation details")
+    parser.add_argument("--server-log", type=Path,
+                        help="server-main.log for acknowledged chunk loading during automatic deeper rescans (default: ../Logs/server-main.log relative to export directory)")
+    parser.add_argument("--rescan-y-min", type=int, default=0,
+                        help="lower Y for automatic 32x32 deeper probes of empty columns (default: 0; normal plan bounds stay unchanged)")
     parser.add_argument("--step-by-step", action="store_true",
                         help="confirm each export instead of using automatic recovery")
     args = parser.parse_args()
@@ -881,6 +932,8 @@ def main() -> int:
     state_path = run_dir / f"{prefix}-progress.json"
     try:
         state = load_state(state_path, signature)
+        state["rescan_settings"] = {"ymin": args.rescan_y_min,
+            "server_log": str(args.server_log.expanduser().resolve()) if args.server_log else None}
         command_dir.mkdir(parents=True, exist_ok=True)
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))

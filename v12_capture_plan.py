@@ -427,7 +427,40 @@ def load_plan(path: Path) -> dict:
     return plan
 
 
-def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER) -> dict:
+def column_presence_record(requested: dict, present: bytearray) -> dict:
+    """Report exact X/Z columns without a block/decor record at any height.
+
+    Absence is unknown, not proof of air. Even a positive column-presence
+    result is not proof that every requested vertical chunk was loaded.
+    """
+    width = requested["xmax"] - requested["xmin"] + 1
+    depth = requested["zmax"] - requested["zmin"] + 1
+    if len(present) != width * depth:
+        raise ValueError("Column-presence mask has the wrong size")
+    observed = sum(present)
+    rows = {}
+    if observed < len(present):
+        for z in range(depth):
+            missing = []
+            x = 0
+            while x < width:
+                if present[z * width + x]:
+                    x += 1
+                    continue
+                start = x
+                while x < width and not present[z * width + x]:
+                    x += 1
+                missing.append((requested["xmin"] + start, requested["xmin"] + x - 1))
+            if missing:
+                rows[requested["zmin"] + z] = missing
+    return {"requested_columns": len(present), "observed_columns": observed,
+            "missing_columns": len(present) - observed,
+            "missing_regions": row_boxes(rows, requested["ymin"], requested["ymax"]),
+            "basis": "At least one Indices or DecorIndices record at any returned height; missing columns are unverified, never inferred air."}
+
+
+def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER,
+                   *, allow_rescans: bool = True) -> dict:
     """Verify sparse records and credit only the actual reported 3D envelope.
 
     This establishes coverage under WorldEdit's reported-envelope contract. It
@@ -454,8 +487,8 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
         blocks, ids = data.get("Indices"), data.get("BlockIds")
         if not isinstance(blocks, list) or not isinstance(ids, list) or len(blocks) != len(ids):
             raise ValueError("Indices and BlockIds must be matching arrays")
-        if not blocks:
-            raise ValueError("Empty sparse export cannot establish coverage")
+        column_width = requested["xmax"] - requested["xmin"] + 1
+        present = bytearray(column_width * (requested["zmax"] - requested["zmin"] + 1))
         for ikey, vkey in (("Indices", "BlockIds"), ("DecorIndices", "DecorIds")):
             indices, values = data.get(ikey, []), data.get(vkey, [])
             if not isinstance(indices, list) or not isinstance(values, list) or len(indices) != len(values):
@@ -473,6 +506,7 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
                 first_ids: dict[int, int] = {}
                 paired: set[int] = set()
                 for index, block_id in zip(indices, values):
+                    present[((index >> 10) & 1023) * column_width + (index & 1023)] = 1
                     if index in paired:
                         raise ValueError("More than two block records at one coordinate")
                     previous = first_ids.get(index)
@@ -491,7 +525,10 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
                     and palette.get(str(block_id)) not in ("game:air", "air")
                     for i, block_id in zip(indices, values))
             else:
+                for index in indices:
+                    present[((index >> 10) & 1023) * column_width + (index & 1023)] = 1
                 result["ceiling_blocks"] += sum((i >> 20) == requested["ymax"] - requested["ymin"] for i in indices)
+        result["column_presence"] = column_presence_record(requested, present)
         entities = data.get("BlockEntities", {})
         if not isinstance(entities, dict):
             raise ValueError("BlockEntities is not an object")
@@ -502,6 +539,23 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
         result["covered"] = {"xmin": requested["xmin"], "xmax": requested["xmin"] + sx - 1,
                              "ymin": requested["ymin"], "ymax": requested["ymin"] + sy - 1,
                              "zmin": requested["zmin"], "zmax": requested["zmin"] + sz - 1}
+        result["verified_regions"] = difference([result["covered"]], result["column_presence"]["missing_regions"])
+        confirmed = []
+        if allow_rescans and data.get("ColumnRescanEvidence"):
+            try:
+                confirmed, result["rescans"] = verify_column_rescans(
+                    path, requested, present, data["ColumnRescanEvidence"], world_center)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                # Preserve credit for direct records, but never credit an
+                # empty band whose external evidence is missing or changed.
+                result["rescan_problems"] = [str(exc)]
+            result["verified_regions"].extend(confirmed)
+        confirmed_columns = sum(volume(b) // (requested["ymax"] - requested["ymin"] + 1) for b in confirmed)
+        result["column_presence"].update(
+            empty_columns_confirmed_by_rescan=confirmed_columns,
+            unverified_columns=result["column_presence"]["missing_columns"] - confirmed_columns)
+        if not blocks and not data.get("DecorIndices") and result["column_presence"]["unverified_columns"]:
+            raise ValueError("Empty sparse export cannot establish coverage")
         if "CapturePlanPieces" in data:
             provenance = data["CapturePlanPieces"]
             if not isinstance(provenance, list) or not provenance:
@@ -515,11 +569,53 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
     except (OSError, ValueError, TypeError, KeyError, UnicodeError) as exc:
         result["problems"].append(str(exc))
         result["covered"] = None
+        result["verified_regions"] = []
     return result
 
 
-def audit_coverage(plan: dict, state: dict, export_dir: Path) -> dict:
-    covers, files, warnings = [], [], []
+def verify_column_rescans(path: Path, requested: dict, present: bytearray,
+                         metadata: dict, world_center: int) -> tuple[list[dict], list[dict]]:
+    """Recheck retained, hash-bound deeper evidence; never trust saved status alone."""
+    if not isinstance(metadata, dict) or metadata.get("version") != 1 or not isinstance(metadata.get("probes"), list):
+        raise ValueError("Invalid column-rescan evidence")
+    confirmed = bytearray(len(present))
+    width = requested["xmax"] - requested["xmin"] + 1
+    evidence_records = []
+    for ref in metadata["probes"]:
+        filename = ref["file"]
+        if not isinstance(filename, str) or Path(filename).name != filename:
+            raise ValueError("Rescan reference must be a filename in the export directory")
+        bounds = box(ref["requested"])
+        check = ref.get("load_check", {})
+        if not (check.get("force_loaded") is True and check.get("queues_clear") is True):
+            raise ValueError("Rescan lacks an acknowledged chunk-load check")
+        if bounds["ymin"] >= requested["ymin"] or bounds["ymax"] < requested["ymax"]:
+            raise ValueError("Rescan must cover below the floor and through the requested ceiling")
+        probe_path = path.parent / filename
+        probe = inspect_export(probe_path, bounds, world_center, allow_rescans=False)
+        if probe["problems"] or probe.get("sha256") != ref.get("sha256") or probe["column_presence"]["missing_columns"]:
+            raise ValueError("Rescan missing, changed, invalid, or still has empty columns: " + filename)
+        data = read_json(probe_path)
+        tops = {}
+        for field in ("Indices", "DecorIndices"):
+            for index in data.get(field, []):
+                x, z = bounds["xmin"] + (index & 1023), bounds["zmin"] + ((index >> 10) & 1023)
+                tops[x, z] = max(tops.get((x, z), bounds["ymin"] - 1), bounds["ymin"] + (index >> 20))
+        count = 0
+        for (x, z), top in tops.items():
+            if requested["xmin"] <= x <= requested["xmax"] and requested["zmin"] <= z <= requested["zmax"]:
+                offset = (z - requested["zmin"]) * width + x - requested["xmin"]
+                if not present[offset] and top < requested["ymin"]:
+                    confirmed[offset] = 1
+                    count += 1
+        evidence_records.append({**ref, "empty_columns_below_floor": count})
+    # Inverting the confirmation mask reuses the exact row-to-rectangle routine.
+    regions = column_presence_record(requested, bytearray(1 - v for v in confirmed))["missing_regions"]
+    return regions, evidence_records
+
+
+def audit_coverage(plan: dict, state: dict, export_dir: Path, progress=None) -> dict:
+    covers, column_covers, direct_column_covers, files, warnings = [], [], [], [], []
     seen = set()
     sections = state.get("sections", {})
 
@@ -538,7 +634,11 @@ def audit_coverage(plan: dict, state: dict, export_dir: Path) -> dict:
         if evidence["covered"] and not evidence.get("pieces") and not record.get("merged"):
             # A direct WorldEdit parent may now validate after a format fix,
             # even while old progress still records failed subdivision work.
-            covers.append(evidence["covered"])
+            verified = evidence["verified_regions"]
+            covers.extend(verified)
+            column_covers.extend({**b, "ymin": 0, "ymax": 0} for b in verified)
+            direct = difference([evidence["covered"]], evidence["column_presence"]["missing_regions"])
+            direct_column_covers.extend({**b, "ymin": 0, "ymax": 0} for b in direct)
             if evidence["ceiling_blocks"] and region["ymax"] == ceiling:
                 warnings.append(f"{name}: {evidence['ceiling_blocks']} block/decor entries at requested Y ceiling {ceiling}")
         # Merged envelopes cannot bridge missing leaf height. Prefer embedded
@@ -557,20 +657,48 @@ def audit_coverage(plan: dict, state: dict, export_dir: Path) -> dict:
                 continue
             collect(child, child_name, ceiling, ancestors | {name})
 
-    for task in plan["cuboids"]:
+    for index, task in enumerate(plan["cuboids"], 1):
+        if progress:
+            progress(index, len(plan["cuboids"]), task["name"])
         collect(box(task), task["name"], task["ymax"], set())
     gaps = difference(plan["requests"], covers)
     total = sum(volume(b) for b in plan["requests"])
     missing = sum(volume(b) for b in gaps)
+    column_requests = row_boxes(rows_for_boxes(plan["requests"]), 0, 0)
+    column_gaps = difference(column_requests, column_covers)
+    requested_columns = sum(volume(b) for b in column_requests)
+    missing_columns = sum(volume(b) for b in column_gaps)
+    without_direct_records = sum(volume(b) for b in difference(column_requests, direct_column_covers))
     return {"version": VERSION, "plan_hash": plan["plan_hash"], "geometry_hash": plan["geometry_hash"],
             "requested_blocks": total, "verified_envelope_blocks": total - missing,
             "coverage_percent": 100 * (total - missing) / total,
             "complete": not gaps, "gaps": gaps, "warnings": warnings, "files": files,
-            "coverage_basis": "Exact requested 3D union minus freshly validated reported export envelopes. Shortened Y is a gap, never inferred air.",
+            "column_presence": {"requested_columns": requested_columns,
+                "observed_columns": requested_columns - missing_columns,
+                "missing_columns": missing_columns, "complete": not column_gaps,
+                "columns_without_direct_records": without_direct_records,
+                "empty_columns_confirmed_by_rescan": without_direct_records - missing_columns,
+                "missing_regions": [{k: b[k] for k in ("xmin", "xmax", "zmin", "zmax")} for b in column_gaps],
+                "files_with_missing_columns": sum(bool(f.get("column_presence", {}).get("missing_columns")) for f in files),
+                "files_with_unverified_columns": sum(bool(f.get("column_presence", {}).get("unverified_columns")) for f in files)},
+            "coverage_basis": "Exact requested 3D union minus freshly validated reported export envelopes and hash-checked deeper rescans with acknowledged load checks. Uncorroborated absent columns and shortened Y remain unverified. Rescans corroborate empty bands conditionally on WorldEdit returning loaded contents.",
             "evidence_limits": "Conditional on WorldEdit accurately reporting exported extents and loaded contents. Sparse JSON alone cannot prove missing records are air or that chunks were resident. Exports at different times are not an atomic world snapshot."}
 
 
-def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None) -> None:
+def audit_progress(index: int, total: int, name: str) -> None:
+    if index == 1 or index % 10 == 0 or index == total:
+        print(f"Auditing export {index}/{total}: {name}", flush=True)
+
+
+def render_column_preview(plan: dict, report: dict, path: Path) -> None:
+    regions = [{**b, "ymin": min(r["ymin"] for r in plan["requests"]),
+                "ymax": max(r["ymax"] for r in plan["requests"])}
+               for b in report["column_presence"]["missing_regions"]]
+    render_preview(plan, path, regions, gap_label="unverified columns")
+
+
+def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None,
+                   gap_label: str = "audit gaps") -> None:
     requests = plan["requests"]
     xmin = min(b["xmin"] for b in plan["cuboids"])
     xmax = max(b["xmax"] for b in plan["cuboids"])
@@ -596,7 +724,7 @@ def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None) -> No
               '<g font-family="sans-serif" fill="#15283c">',
               '<text x="24" y="30" font-size="21">v12 capture footprint and export mosaic</text>',
               f'<text x="24" y="53" font-size="12">{len(plan["cuboids"])} units · X ≤{plan["partition"].get("x_span", MAX_SIDE)}, Z ≤{plan["partition"]["z_span"]} · {extra:,} extra block positions</text>',
-              '<text x="24" y="73" font-size="12">Blue: buffered request · dark blue: mouths/gap · orange: cuboids · red: audit gaps</text>',
+              f'<text x="24" y="73" font-size="12">Blue: buffered request · dark blue: mouths/gap · orange: cuboids · red: {escape(gap_label)}</text>',
               f'<text x="24" y="93" font-size="12">X {xmin}..{xmax} → · Z {zmin}..{zmax} ↓ · requested Y {plan["requested_y"]["ymin"]}..{plan["requested_y"]["ymax"]}</text>',
               f'<text x="24" y="113" font-size="11">Plan SHA256 {plan["plan_hash"]}</text>',
               '<text x="24" y="131" font-size="11">Mouth anchors are capture limits. Height supplements can overlap in this top view.</text>',
@@ -670,11 +798,14 @@ def main() -> int:
             state = read_json(progress) if progress.exists() else {}
             if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
                 raise ValueError("Progress belongs to a different capture plan")
-            report = audit_coverage(plan, state, args.export_dir.expanduser())
+            report = audit_coverage(plan, state, args.export_dir.expanduser(), progress=audit_progress)
             output = args.plan.with_name(plan["prefix"] + "-audit.json")
             output.write_text(json.dumps(report, indent=2) + "\n")
             render_preview(plan, args.plan.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
+            render_column_preview(plan, report, args.plan.with_name(plan["prefix"] + "-columns.svg"))
             print(f"3D coverage: {report['coverage_percent']:.6f}%; {len(report['gaps'])} exact gap boxes; {len(report['warnings'])} ceiling warnings.")
+            print(f"Unverified columns: {report['column_presence']['missing_columns']:,}; "
+                  f"empty bands corroborated by deeper rescans: {report['column_presence']['empty_columns_confirmed_by_rescan']:,}.")
             print(f"Audit: {output}\n{report['evidence_limits']}")
             return 0 if report["complete"] else 1
     except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
