@@ -17,13 +17,15 @@ import v12_capture_plan as p
 class Console:
     """Match each command's acknowledgement in the local server log."""
 
-    def __init__(self, binary, pane, logfile, work, sender):
+    def __init__(self, binary, pane, logfile, work, sender, activity=None):
         self.binary, self.pane, self.logfile = binary, pane, Path(logfile)
         self.work, self.sender = Path(work), sender
+        self.activity = activity or (lambda description: None)
         self.work.mkdir(parents=True, exist_ok=True)
         self.sequence = max((int(f.stem) for f in self.work.glob('*.txt') if f.stem.isdigit()), default=0)
 
     def command(self, command, expected, timeout=60):
+        self.activity('Waiting for server acknowledgement: ' + command)
         self.sequence += 1
         command_file = self.work / f'{self.sequence:04d}.txt'
         command_file.write_text(command + '\n')
@@ -80,7 +82,10 @@ def capture_loaded_export(bounds, name, export_dir, player, console, stable, arc
         f"/executeas {player} /we select {bounds['xmin']} {bounds['ymin']} {bounds['zmin']} {bounds['xmax']} {bounds['ymax']} {bounds['zmax']}",
         r'Start and end position marked')
     console.command(f'/executeas {player} /we export {name}', r'\d+ blocks.*exported', 120)
+    activity = getattr(console, 'activity', lambda description: None)
+    activity('Waiting for stable recovery export: ' + name)
     stable(path)
+    activity('Validating recovery export: ' + name)
     evidence = p.inspect_export(path, bounds, allow_rescans=False)
     if evidence['problems'] and evidence['problems'] != ['Empty sparse export cannot establish coverage']:
         raise ValueError('Loaded export failed validation: ' + name + ': ' + '; '.join(evidence['problems']))
@@ -214,6 +219,7 @@ def rescan_export(path, requested, *, prefix, player, console, export_dir,
 
     def checkpoint(ref, deeper):
         nonlocal current_bytes, current, evidence, restored
+        getattr(console, 'activity', lambda description: None)('Applying and saving recovery export: ' + ref['file'])
         bounds = ref['requested']
         combined, added = fill_missing_columns(current, requested, [(bounds, p.read_json(export_dir/ref['file']))])
         if deeper:

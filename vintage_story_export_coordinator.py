@@ -18,6 +18,7 @@ exits immediately using the last completed checkpoint.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -320,19 +321,88 @@ class RunStatus:
         self.state = state
         self.started = time.monotonic()
         self.last_report = self.started
+        self.activity = ("Starting", self.started, None)
+        self.handling_signal = False
+
+    def configure(self, cuboids: list[Cuboid], state: dict[str, Any]) -> None:
+        self.cuboids, self.state = cuboids, state
+
+    def set_activity(self, description: str, region: Cuboid | None = None,
+                     clear_region: bool = False) -> None:
+        # One assignment gives a signal handler a consistent activity snapshot.
+        self.activity = (description, time.monotonic(),
+                         None if clear_region else region or self.activity[2])
+
+    def status_text(self) -> str:
+        now = time.monotonic()
+        sections = self.state.get("sections", {})
+        statuses = [sections.get(c.name, {}).get("status", "pending") for c in self.cuboids]
+        verified, accepted = statuses.count("complete"), statuses.count("accepted")
+        done, total = verified + accepted, len(self.cuboids)
+        partial = sum(s in ("partial", "incomplete") for s in statuses)
+        active = statuses.count("waiting")
+        pending = total - done - partial - active
+        description, since, region = self.activity
+        text = (f"Status (PID {os.getpid()}): {done}/{total} selections finished "
+                f"({100 * done / total if total else 0:.1f}%; {verified} verified, {accepted} accepted); "
+                f"{partial} partial/incomplete, {active} waiting, {pending} pending. "
+                f"Elapsed {now - self.started:.0f}s.\nCurrent: {description} ({now - since:.0f}s).")
+        if region:
+            text += "\n" + region_label(region)
+            checkpoint = self.state.get("column_rescans", {}).get("sections", {}).get(region.name, {})
+            if "unverified_columns" in checkpoint:
+                text += (f"\nLast rescan checkpoint: {checkpoint.get('restored_columns', 0):,} columns restored, "
+                         f"{checkpoint.get('empty_columns_confirmed_by_rescan', 0):,} empty bands corroborated, "
+                         f"{checkpoint['unverified_columns']:,} unverified.")
+        return text
+
+    def on_status_signal(self, signum, frame) -> None:
+        if self.handling_signal:
+            return
+        self.handling_signal = True
+        try:
+            # A signal can interrupt print() while its buffered stream is
+            # locked. Bypass Python's buffered I/O rather than reentering it.
+            os.write(2, ("\n" + self.status_text() + "\n").encode("utf-8", errors="replace"))
+        except OSError:
+            pass  # A closed diagnostic stream must not interrupt collection.
+        finally:
+            self.handling_signal = False
 
     def maybe_report(self, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self.last_report < STATUS_INTERVAL:
             return
-        complete = sum(
-            self.state.get("sections", {}).get(c.name, {}).get("status") in ("complete", "accepted")
-            for c in self.cuboids
-        )
-        total = len(self.cuboids)
-        percent = 100.0 * complete / total if total else 100.0
-        print(f"Status: {complete} complete of {total} ({percent:.1f}%).")
+        print(self.status_text(), flush=True)
         self.last_report = now
+
+
+ACTIVE_STATUS: RunStatus | None = None
+
+
+def report_activity(description: str, region: Cuboid | None = None,
+                    clear_region: bool = False) -> None:
+    if ACTIVE_STATUS:
+        ACTIVE_STATUS.set_activity(description, region, clear_region)
+
+
+@contextmanager
+def status_signals(reporter: RunStatus):
+    """Install SIGINFO where available and SIGUSR1; restore handlers on exit."""
+    global ACTIVE_STATUS
+    previous_reporter, ACTIVE_STATUS = ACTIVE_STATUS, reporter
+    previous_handlers = {}
+    try:
+        for name in ("SIGINFO", "SIGUSR1"):
+            number = getattr(signal, name, None)
+            if number is not None and number not in previous_handlers:
+                previous_handlers[number] = signal.getsignal(number)
+                signal.signal(number, reporter.on_status_signal)
+        yield
+    finally:
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
+        ACTIVE_STATUS = previous_reporter
 
 
 class UserQuit(Exception):
@@ -358,6 +428,7 @@ def pause_after_interrupt(state: dict[str, Any], state_path: Path) -> None:
     """Save once and prompt; another Ctrl-C aborts even during that save."""
     previous_handler = signal.signal(signal.SIGINT, abort_immediately)
     try:
+        report_activity("Paused; waiting for retry/quit choice")
         print("\nPaused. Saving progress ... (Ctrl-C again aborts)", flush=True)
         try_save_state(state_path, state)
         while True:
@@ -394,8 +465,9 @@ def maybe_rescan_export(c: Cuboid, output_path: Path, player: str, target_pane: 
         print(f"Cannot verify chunk loading for deeper rescan: server log unavailable at {logfile}. Use --server-log.")
         return
     registry = state.setdefault("column_rescans", {"version": 1, "probes": {}, "sections": {}})
+    report_activity("Checking missing columns and retained rescan evidence", c)
     console = capture_rescan.Console(tmux_binary, target_pane, logfile,
-                                    command_dir / "rescans", paste_commands)
+                                    command_dir / "rescans", paste_commands, activity=report_activity)
     try:
         capture_rescan.rescan_export(
             output_path, cuboid_record(c), prefix=state.get("signature", {}).get("prefix", c.name),
@@ -418,6 +490,7 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
                        tmux_binary: str = "tmux") -> tuple[str, list[str]]:
     """Send one section export and return complete/incomplete/skipped plus problems."""
     output_path = export_dir / f"{c.name}.json"
+    report_activity("Preparing export commands", c)
     archive_invalid(output_path)
     command_path = command_dir / f"{c.name}.txt"
     command_text = (
@@ -428,6 +501,7 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
     if confirm or verbose:
         print(f"Command file ready for {region_label(c)}.")
     if confirm:
+        report_activity("Waiting for export confirmation", c)
         choice = input("Press Return to load and paste these commands; n to skip; q to quit: ").strip().lower()
         if choice.startswith("q"):
             raise KeyboardInterrupt
@@ -437,6 +511,7 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
             print("No action taken; press Return to send, n to skip, or q to quit.")
             return "not-sent", []
     paste_commands(command_path, target_pane, tmux_binary)
+    report_activity("Waiting for export file to appear and become stable", c)
     if confirm or verbose:
         print("Commands pasted. Waiting for the export file to appear.")
     state["sections"][c.name] = {"status": "waiting", "file": str(output_path)}
@@ -447,6 +522,7 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
         raise KeyboardInterrupt
     maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
                         state, state_path, tmux_binary)
+    report_activity("Validating export", c)
     problems = validate_export(output_path, c)
     if problems:
         state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
@@ -476,6 +552,7 @@ def teleport_player_to_cuboid(c: Cuboid, player: str, target_pane: str,
                               command_dir: Path, verbose: bool = True,
                               tmux_binary: str = "tmux") -> Path:
     """Request creative mode and teleport using the same X/Z coordinates as `/we select`."""
+    report_activity("Teleporting player and waiting before retry", c)
     x = (c.xmin + c.xmax) // 2
     y = max(c.ymin, c.ymax - 2)
     z = (c.zmin + c.zmax) // 2
@@ -516,6 +593,7 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
     """Attempt, teleport and retry, then split at most twice before asking."""
     output_path = export_dir / f"{c.name}.json"
     saved = state.get("sections", {}).get(c.name, {})
+    report_activity("Checking saved selection and recovery state", c)
     if restart_pending and output_path.exists():
         checkpoint = state.get("column_rescans", {}).get("sections", {}).get(c.name, {})
         if checkpoint.get("sha256"):
@@ -843,12 +921,18 @@ def finalize_split_result(c: Cuboid, pieces: list[tuple[Cuboid, Path]], gaps: li
 
 
 def prompt_value(label: str, default: str) -> str:
+    report_activity("Waiting for input: " + label)
     value = input(f"{label} [{default}]: ").strip()
     return value or default
 
 
 def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path) -> int:
-    report = capture_plan.audit_coverage(plan, state, export_dir, progress=capture_plan.audit_progress)
+    report_activity("Starting coverage audit", clear_region=True)
+    def progress(index, total, name):
+        report_activity(f"Auditing export {index}/{total}: {name}", clear_region=True)
+        capture_plan.audit_progress(index, total, name)
+    report = capture_plan.audit_coverage(plan, state, export_dir, progress=progress)
+    report_activity("Writing coverage report and previews", clear_region=True)
     path = plan_path.with_name(plan["prefix"] + "-audit.json")
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(report, indent=2) + "\n")
@@ -868,7 +952,7 @@ def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path)
     return 0 if report["complete"] else 1
 
 
-def main() -> int:
+def _main(status_reporter: RunStatus) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN,
                         help="saved coastline capture plan (default: capture-plans/coastal-connection/plan.json beside the script)")
@@ -894,6 +978,10 @@ def main() -> int:
     args.plan = args.plan.expanduser().resolve()
     try:
         plan = capture_plan.load_plan(args.plan)
+        cuboids = [Cuboid(item["index"], **capture_plan.box(item), name=item["name"])
+                   for item in plan["cuboids"]]
+        status_reporter.configure(cuboids, {"sections": {}})
+        report_activity("Rendering plan preview", clear_region=True)
         capture_plan.render_preview(plan, args.plan.with_suffix(".svg"))
         if args.preview:
             capture_plan.print_summary(plan, args.plan)
@@ -901,6 +989,7 @@ def main() -> int:
         if args.report_coverage:
             progress = args.plan.with_name(plan["prefix"] + "-progress.json")
             state = capture_plan.read_json(progress) if progress.exists() else {}
+            status_reporter.configure(cuboids, state)
             if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
                 raise ValueError("Progress belongs to a different capture plan")
             export_path = args.export_dir or state.get("signature", {}).get("export_dir")
@@ -925,8 +1014,6 @@ def main() -> int:
         return 2
 
     prefix = plan["prefix"]
-    cuboids = [Cuboid(item["index"], **capture_plan.box(item), name=item["name"])
-               for item in plan["cuboids"]]
     bounds = {key: (min if key.endswith("min") else max)(b[key] for b in plan["requests"])
               for key in capture_plan.BOUND_KEYS}
     y_bounds = plan["requested_y"]
@@ -947,7 +1034,8 @@ def main() -> int:
     except (OSError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     print(f"Command files: {command_dir}")
-    status_reporter = RunStatus(cuboids, state)
+    status_reporter.configure(cuboids, state)
+    report_activity("Revalidating existing exports before collection", clear_region=True)
     complete_now = accepted_now = incomplete_now = absent_now = 0
     for c in cuboids:
         output_path = export_dir / f"{c.name}.json"
@@ -976,10 +1064,15 @@ def main() -> int:
     print(f"Progress: {state_path}\nVerified {complete_now}; accepted {accepted_now}; incomplete {incomplete_now}; pending {absent_now}.")
     if not args.step_by_step:
         print("Ctrl-C pauses; r retries, q quits, a second Ctrl-C aborts.")
+    if hasattr(signal, "SIGINFO"):
+        print(f"Ctrl-T (SIGINFO) reports status immediately; also: kill -USR1 {os.getpid()}")
+    elif hasattr(signal, "SIGUSR1"):
+        print(f"Immediate status: kill -USR1 {os.getpid()} (this system has no Ctrl-T/SIGINFO).")
 
     original_sigint_handler = signal.getsignal(signal.SIGINT)
     try:
         for c in cuboids:
+            report_activity("Checking next selection", c)
             record = state["sections"].get(c.name, {})
             output_path = export_dir / f"{c.name}.json"
             if (record.get("status") in ("complete", "accepted") and output_path.exists()
@@ -1087,6 +1180,12 @@ def main() -> int:
         return 2
     finally:
         signal.signal(signal.SIGINT, original_sigint_handler)
+
+
+def main() -> int:
+    reporter = RunStatus([], {"sections": {}})
+    with status_signals(reporter):
+        return _main(reporter)
 
 
 if __name__ == "__main__":

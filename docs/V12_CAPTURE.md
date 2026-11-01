@@ -63,6 +63,28 @@ for a different capture prefix or Y interval. Changing the tmux pane/player
 does not invalidate geometric progress. Changing the export directory for an
 existing progress record is rejected instead of overwriting that record.
 
+### Immediate status: Ctrl-T and signals
+
+On macOS/BSD, press **Ctrl-T** while the coordinator is running to request an
+immediate status report via `SIGINFO`. The terminal's status character must
+be enabled; if remapped, `stty status '^T'` restores it on those systems.
+
+On Linux, use **`kill -USR1 PID`** from another shell. Linux does not support
+the terminal `SIGINFO`/Ctrl-T mechanism. The operating system running Python
+determines this, so a Mac terminal connected to a Linux server still uses the
+Linux method. The coordinator prints its PID and the status command at startup.
+`SIGUSR1` also works on macOS/BSD, and `kill -INFO PID` works where `SIGINFO`
+is available. See the [terminal status-character documentation](https://man7.org/linux/man-pages/man3/termios.3.html).
+
+The report includes finished/verified/accepted selection counts, partial and
+pending counts, elapsed time, current operation and its duration, selection
+bounds, and the last available rescan checkpoint. Export waits, server-command
+acknowledgements, recovery exports, and coverage audits identify their current
+operation. Status is printed to stderr without pausing or restarting work,
+sending commands, writing checkpoints, or performing a fresh coverage audit.
+The counts describe execution progress rather than a new proof of coverage.
+Ctrl-C retains its existing pause/quit behavior.
+
 The collector has no `--prefix` or `--z-span` option. Make geometry, height,
 and section-size changes with `v12_capture_plan.py`, review the resulting plan,
 then run the collector against that saved specification. A missing or invalid
