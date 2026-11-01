@@ -88,6 +88,44 @@ geometry, partitioning, or supplements. The generator refuses to overwrite a
 different existing plan; generate a draft with `--output` before promoting it
 to the current Git-versioned plan.
 
+## Interpreting export failures and height messages
+
+WorldEdit's sparse block list can contain two entries at the same packed
+coordinate: one solid-layer block and one fluid-layer block. For example, a
+seaweed block and salt water can share a position. The
+[official schematic packing code](https://github.com/anegostudios/vsapi/blob/master/Common/Collectible/Block/BlockSchematic.cs)
+deliberately writes both entries. A validator error saying only
+`Duplicate block indices` was a coordinator bug, not evidence that teleporting
+failed to load that section.
+
+The validator now accepts two distinct block IDs at one coordinate, preserves
+both, and rejects repeated identical records or more than two block records
+at a coordinate. It validates the export format, not the game rules governing
+which specific solid/fluid combinations should occur. The JSON palette gives
+block codes but does not provide all block classes, placement rules, or mod
+behavior. No hardcoded plant/water compatibility list is used. Different fresh,
+salt, still, and flowing water codes are retained; the collector does not
+simulate their behavior or substitute one type for another. Merges retain
+both block-layer records.
+
+After updating from the version with the duplicate-index bug, restart with
+the same plan and export directory. Existing exports are revalidated. A usable
+direct parent export can supersede its earlier failed-split checkpoint;
+there is no need to delete the progress file or discard valid export data.
+
+`export validated (height trimmed)` means the JSON passed the file checks but
+its stored height is shorter than the requested height. WorldEdit omits air
+and computes dimensions from stored blocks, so this alone does not indicate
+a failed export. The final 3D audit conservatively leaves the omitted upper
+height unverified. A valid file and proven coverage of the entire requested
+height are different results.
+
+Teleport recovery currently waits a fixed 1.5 seconds before retrying. That
+delay is not an acknowledgement from the server that every required chunk is
+loaded. An initial empty export may still require chunk loading, while a
+format-validation error should be diagnosed from its printed reason. Reasons
+are now printed in normal automatic output as well as verbose output.
+
 ## Geometry and completeness
 
 For integer Z=59375–59749 the west boundary is X=-34500 and the east boundary

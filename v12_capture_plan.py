@@ -466,8 +466,23 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
             if any(type(i) is not int or i < 0 for i in values):
                 raise ValueError(f"{vkey} contains invalid IDs")
             if ikey == "Indices":
-                if len(set(indices)) != len(indices):
-                    raise ValueError("Duplicate block indices")
+                # BlockSchematic.Pack writes the same coordinate twice when
+                # both solid and fluid layers are occupied. Preserve both IDs;
+                # a coordinate alone does not identify a block-layer record.
+                # https://github.com/anegostudios/vsapi/blob/master/Common/Collectible/Block/BlockSchematic.cs
+                first_ids: dict[int, int] = {}
+                paired: set[int] = set()
+                for index, block_id in zip(indices, values):
+                    if index in paired:
+                        raise ValueError("More than two block records at one coordinate")
+                    previous = first_ids.get(index)
+                    if previous is None:
+                        first_ids[index] = block_id
+                    elif previous == block_id:
+                        raise ValueError("Repeated identical block record at one coordinate")
+                    else:
+                        paired.add(index)
+                result["layered_positions"] = len(paired)
                 palette = data.get("BlockCodes", {})
                 if not isinstance(palette, dict):
                     raise ValueError("BlockCodes is not an object")
@@ -512,22 +527,6 @@ def audit_coverage(plan: dict, state: dict, export_dir: Path) -> dict:
         if name in ancestors:
             raise ValueError("Cycle in saved export tree")
         record = sections.get(name, {})
-        # Always re-read leaves. A merged SizeY must not bridge missing height.
-        pieces = record.get("piece_regions", [])
-        if record.get("segmented") and pieces:
-            for item in pieces:
-                child = box(item)
-                if intersection(child, region) != child:
-                    warnings.append(f"Discarded piece outside parent: {item.get('file')}")
-                    continue
-                collect(child, Path(item["file"]).stem, ceiling, ancestors | {name})
-            return
-        if record.get("segmented") and record.get("children"):
-            for child in record["children"]:
-                child_bounds = box(child)
-                if intersection(child_bounds, region) == child_bounds:
-                    collect(child_bounds, child["name"], ceiling, ancestors | {name})
-            return
         # Saved filenames are metadata; use the chosen export directory only.
         path = export_dir / (name + ".json")
         key = (str(path), tuple(region[k] for k in BOUND_KEYS))
@@ -536,14 +535,27 @@ def audit_coverage(plan: dict, state: dict, export_dir: Path) -> dict:
         seen.add(key)
         evidence = inspect_export(path, region, plan["world_center"])
         files.append(evidence)
-        if evidence.get("pieces") and evidence["covered"]:
-            for item in evidence["pieces"]:
-                collect(box(item), Path(item["file"]).stem, ceiling, ancestors | {name})
-            return
-        if evidence["covered"]:
+        if evidence["covered"] and not evidence.get("pieces") and not record.get("merged"):
+            # A direct WorldEdit parent may now validate after a format fix,
+            # even while old progress still records failed subdivision work.
             covers.append(evidence["covered"])
             if evidence["ceiling_blocks"] and region["ymax"] == ceiling:
                 warnings.append(f"{name}: {evidence['ceiling_blocks']} block/decor entries at requested Y ceiling {ceiling}")
+        # Merged envelopes cannot bridge missing leaf height. Prefer embedded
+        # provenance, or use all retained AND pending children from progress.
+        if evidence["covered"] and evidence.get("pieces"):
+            children = evidence["pieces"]
+        elif record.get("segmented"):
+            children = record.get("piece_regions", []) + record.get("children", [])
+        else:
+            children = []
+        for item in children:
+            child = box(item)
+            child_name = item.get("name") or Path(item["file"]).stem
+            if intersection(child, region) != child:
+                warnings.append(f"Discarded piece outside parent: {child_name}")
+                continue
+            collect(child, child_name, ceiling, ancestors | {name})
 
     for task in plan["cuboids"]:
         collect(box(task), task["name"], task["ymax"], set())

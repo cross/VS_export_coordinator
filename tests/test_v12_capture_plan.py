@@ -304,7 +304,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_malformed_out_of_bounds_empty_and_decor(self):
         bad = []
-        for change in [dict(Indices=[1023]), dict(Indices=[] ,BlockIds=[]), dict(DecorIndices=[0], DecorIds=[]), dict(SizeY=117), dict(OriginalPos={}), dict(Indices=[0, 0], BlockIds=[1, 1])]:
+        for change in [dict(Indices=[1023]), dict(Indices=[] ,BlockIds=[]), dict(DecorIndices=[0], DecorIds=[]), dict(SizeY=117), dict(OriginalPos={}), dict(Indices=[0, 0], BlockIds=[1, 1]), dict(Indices=[0, 0, 0], BlockIds=[1, 2, 3])]:
             bad.append({**export_data(self.b), **change})
         bad.append([])
         for data in bad:
@@ -312,6 +312,65 @@ class EvidenceTests(unittest.TestCase):
                 result = self.inspect(data)
                 self.assertIsNone(result['covered'])
                 self.assertTrue(result['problems'])
+
+    def test_solid_fluid_pairs_preserve_distinct_water_codes(self):
+        data = export_data(self.b)
+        data.update(Indices=[0, 0, 1, 1], BlockIds=[1, 2, 3, 4],
+                    BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7',
+                                '3': 'game:rock-peridotite', '4': 'game:water-still-7'})
+        evidence = self.inspect(data)
+        self.assertFalse(evidence['problems'])
+        self.assertEqual(evidence['layered_positions'], 2)
+        c = coordinator.Cuboid(1, **self.b, name='piece')
+        self.assertFalse(coordinator.validate_export(self.path, c))
+        self.assertEqual(json.loads(self.path.read_text()), data)
+
+    def test_resume_can_use_valid_parent_instead_of_old_failed_splits(self):
+        data = export_data(self.b)
+        data.update(Indices=[0, 0], BlockIds=[1, 2],
+                    BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7'})
+        self.inspect(data)
+        c = coordinator.Cuboid(1, **self.b, name='piece')
+        previous = {'segmented': True, 'status': 'partial', 'children': [{'name': 'missing'}],
+                    'gaps': [self.b], 'problems': ['Duplicate block indices']}
+        record = coordinator.validated_export_record(c, self.path, previous)
+        self.assertEqual(record['status'], 'complete')
+        self.assertNotIn('children', record)
+        self.assertNotIn('segmented', record)
+        self.assertNotIn('gaps', record)
+
+    def test_audit_checks_valid_parent_and_pending_children(self):
+        directory = Path(self.temp.name)
+        parent = {**self.b, 'name': 'piece'}
+        left, right = {**self.b, 'xmax': -1}, {**self.b, 'xmin': 0}
+        (directory/'left.json').write_text(json.dumps(export_data(left)))
+        (directory/'right.json').write_text(json.dumps(export_data(right)))
+        state = {'sections': {'piece': {'status': 'partial', 'segmented': True,
+                  'piece_regions': [{**left, 'file': 'left.json'}],
+                  'children': [{**right, 'name': 'right'}]}}}
+        plan = dict(cuboids=[parent], requests=[self.b], world_center=p.WORLD_CENTER,
+                    plan_hash='test', geometry_hash='test')
+        self.assertTrue(p.audit_coverage(plan, state, directory)['complete'])
+        self.path.write_text(json.dumps(export_data(self.b)))
+        self.assertTrue(p.audit_coverage(plan, state, directory)['complete'])
+
+    def test_merge_preserves_two_layers_at_each_position(self):
+        directory = Path(self.temp.name)
+        parent = coordinator.Cuboid(1, **self.b, name='parent')
+        pieces = []
+        for name, bounds in (('left', {**self.b, 'xmax': -1}), ('right', {**self.b, 'xmin': 0})):
+            c = coordinator.Cuboid(1, **bounds, name=name)
+            data = export_data(bounds)
+            data.update(Indices=[0, 0], BlockIds=[1, 2],
+                        BlockCodes={'1': 'game:seaweed-section', '2': 'game:saltwater-still-7'})
+            path = directory/(name+'.json')
+            path.write_text(json.dumps(data))
+            pieces.append((c, path))
+        coordinator.merge_exports(parent, pieces, self.path)
+        merged = json.loads(self.path.read_text())
+        self.assertEqual(merged['Indices'], [0, 0, 5, 5])
+        self.assertEqual(merged['BlockIds'], [1, 2, 1, 2])
+        self.assertFalse(coordinator.validate_export(self.path, parent))
 
     def test_oversized_merge_rejected_before_writing(self):
         c = coordinator.Cuboid(1, 0, 1023, 0, 5, 0, 5, 'too_wide')

@@ -220,6 +220,25 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
     return problems
 
 
+def validated_export_record(c: Cuboid, path: Path, previous: dict | None = None) -> dict:
+    """Replace failed-split state when a usable direct parent export exists."""
+    evidence = capture_plan.inspect_export(path, cuboid_record(c))
+    if evidence["problems"] or evidence["covered"] is None:
+        raise ValueError("Cannot checkpoint an invalid export: " + "; ".join(evidence["problems"]))
+    # Keep evidence for a locally merged file: its envelope must not conceal a
+    # missing upper layer in an individual piece. Direct WorldEdit files can
+    # supersede the recovery tree that the earlier validator created for them.
+    retained = previous if previous and previous.get("merged") else {}
+    record = {**retained, "status": "complete", "file": str(path),
+              "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "returned_bounds": evidence["covered"], "ceiling_blocks": evidence["ceiling_blocks"]}
+    if evidence.get("pieces"):
+        pieces = [{**item, "file": str(path.parent / Path(item["file"]).name)} for item in evidence["pieces"]]
+        record.update(merged=True, segmented=True, piece_regions=pieces,
+                      pieces=[item["file"] for item in pieces], gaps=[])
+    return record
+
+
 def returned_export_bounds(path: Path, c: Cuboid) -> dict[str, int] | None:
     """Return the independently validated, reported three-dimensional envelope."""
     return capture_plan.inspect_export(path, cuboid_record(c))["covered"]
@@ -394,20 +413,22 @@ def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Pa
         state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
         save_state(state_path, state)
         if not confirm and not verbose:
-            print("incomplete")
+            print("incomplete: " + "; ".join(problems))
         return "incomplete", problems
     state["sections"][c.name] = {"status": "complete", "file": str(output_path),
                                  "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
     state["sections"][c.name].update(returned_bounds=evidence["covered"],
                                      ceiling_blocks=evidence["ceiling_blocks"])
+    short_height = evidence["covered"] and evidence["covered"]["ymax"] < c.ymax
+    if not confirm and not verbose:
+        print("export validated" + (" (height trimmed)" if short_height else ""))
     if evidence["ceiling_blocks"]:
         print(f"\nHeight warning: {evidence['ceiling_blocks']} entries reach requested Y ceiling {c.ymax} in {c.name}.")
-    if evidence["covered"] and evidence["covered"]["ymax"] < c.ymax:
-        print(f"\nHeight coverage unresolved: {c.name} reports Y through {evidence['covered']['ymax']}; requested through {c.ymax}.")
+    if short_height:
+        print(f"Stored height ends at Y {evidence['covered']['ymax']}; requested through {c.ymax}. "
+              "WorldEdit omits air; the final audit keeps this height difference unverified.")
     save_state(state_path, state)
-    if not confirm and not verbose:
-        print("complete")
     return "complete", []
 
 
@@ -456,8 +477,7 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
     output_path = export_dir / f"{c.name}.json"
     saved = state.get("sections", {}).get(c.name, {})
     if not restart_pending and output_path.exists() and not validate_export(output_path, c):
-        state["sections"][c.name] = {**saved, "status": "complete", "file": str(output_path),
-                                     "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        state["sections"][c.name] = validated_export_record(c, output_path, saved)
         save_state(state_path, state)
         if verbose:
             print(f"Already complete: {region_label(c)}")
@@ -520,7 +540,8 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
                                     state, state_path, confirm=False, verbose=verbose,
                                     tmux_binary=tmux_binary)
         if verbose:
-            print(f"Export {result[0]} for {region_label(c)}.")
+            label = "passed validation" if result[0] == "complete" else result[0]
+            print(f"Export {label} for {region_label(c)}.")
             for problem in result[1]:
                 print(f"  - {problem}")
         status_reporter.maybe_report()
@@ -535,7 +556,7 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
                               tmux_binary=tmux_binary)
     print(f"waiting {AUTO_TELEPORT_DELAY}s ... ", end="", flush=True)
     time.sleep(AUTO_TELEPORT_DELAY)
-    print("ready")
+    print("delay elapsed; retrying export")
     status_reporter.maybe_report()
     result, problems = attempt()
     if result == "complete":
@@ -547,7 +568,7 @@ def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
                     for child in split_largest_dimension(c, f"{c.name}_d{depth+1}")]
         pieces, gaps = process_children(children, [])
         if not gaps:
-            print(f"section {c.index} complete")
+            print(f"section {c.index} export files validated")
         return pieces, gaps
 
     if verbose:
@@ -754,8 +775,8 @@ def finalize_split_result(c: Cuboid, pieces: list[tuple[Cuboid, Path]], gaps: li
                 "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")
             }
             save_state(state_path, state)
-            print(f"Section {c.index} complete: all {len(pieces)} split exports cover it, "
-                  "and the combined export passed validation.")
+            print(f"Section {c.index}: all {len(pieces)} split files and the combined export passed validation. "
+                  "The final audit determines 3D coverage.")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             state["sections"][c.name] = {
                 **state["sections"].get(c.name, {}),
@@ -764,7 +785,7 @@ def finalize_split_result(c: Cuboid, pieces: list[tuple[Cuboid, Path]], gaps: li
                 "problems": [f"Could not combine split exports: {exc}"]
             }
             save_state(state_path, state)
-            print(f"Section {c.index} is fully covered by {len(pieces)} split exports, "
+            print(f"Section {c.index} has {len(pieces)} validated split files, "
                   f"but the combined file could not be created: {exc}")
     else:
         print("No usable export pieces were returned; the full section is recorded as an uncovered region.")
@@ -876,8 +897,7 @@ def main() -> int:
                     accepted_now += 1
                 else:
                     complete_now += 1
-                    state["sections"][c.name] = {**previous, "status": "complete", "file": str(output_path),
-                                                 "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                    state["sections"][c.name] = validated_export_record(c, output_path, previous)
             else:
                 incomplete_now += 1
                 if not (previous.get("segmented") or
@@ -905,8 +925,7 @@ def main() -> int:
                 print(f"Section {c.index}/{len(cuboids)} already complete or accepted; moving on.")
                 continue
             if output_path.exists() and not validate_export(output_path, c):
-                state["sections"][c.name] = {**record, "status": "complete", "file": str(output_path),
-                                             "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                state["sections"][c.name] = validated_export_record(c, output_path, record)
                 save_state(state_path, state)
                 continue
 
@@ -949,7 +968,7 @@ def main() -> int:
                     save_state(state_path, state)
                     break
                 if status == "complete":
-                    print(f"Section {c.index} complete: the full export passed validation. Moving to the next section.")
+                    print(f"Section {c.index}: export file passed validation. The final audit checks 3D coverage.")
                     break
                 print(f"Export is incomplete for {region_label(c)}:")
                 for problem in problems:
