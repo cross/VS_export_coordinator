@@ -184,7 +184,7 @@ def merge_exports(parent: Cuboid, pieces: list[tuple[Cuboid, Path]], destination
     tmp.replace(destination)
 
 
-def validate_export(path: Path, c: Cuboid) -> list[str]:
+def validate_export(path: Path, c: Cuboid, *, evidence: dict | None = None) -> list[str]:
     problems: list[str] = []
     try:
         with path.open("r", encoding="utf-8") as stream:
@@ -214,7 +214,8 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
     for key in ("DecorIndices", "DecorIds"):
         if key in data and not isinstance(data[key], list):
             problems.append(f"{key} is not an array")
-    evidence = capture_plan.inspect_export(path, cuboid_record(c))
+    if evidence is None:
+        evidence = capture_plan.inspect_export(path, cuboid_record(c))
     problems.extend(evidence["problems"])
     columns = evidence.get("column_presence", {})
     missing = columns.get("unverified_columns", columns.get("missing_columns", 0))
@@ -223,9 +224,11 @@ def validate_export(path: Path, c: Cuboid) -> list[str]:
     return problems
 
 
-def validated_export_record(c: Cuboid, path: Path, previous: dict | None = None) -> dict:
+def validated_export_record(c: Cuboid, path: Path, previous: dict | None = None,
+                            *, evidence: dict | None = None) -> dict:
     """Replace failed-split state when a usable direct parent export exists."""
-    evidence = capture_plan.inspect_export(path, cuboid_record(c))
+    if evidence is None:
+        evidence = capture_plan.inspect_export(path, cuboid_record(c))
     if evidence["problems"] or evidence["covered"] is None:
         raise ValueError("Cannot checkpoint an invalid export: " + "; ".join(evidence["problems"]))
     if evidence.get("column_presence", {}).get("unverified_columns"):
@@ -343,8 +346,11 @@ class RunStatus:
         active = statuses.count("waiting")
         pending = total - done - partial - active
         description, since, region = self.activity
+        count_text = f"{verified} verified"
+        if accepted > 0:
+            count_text += f", {accepted} manually accepted"
         text = (f"Status (PID {os.getpid()}): {done}/{total} selections finished "
-                f"({100 * done / total if total else 0:.1f}%; {verified} verified, {accepted} accepted); "
+                f"({100 * done / total if total else 0:.1f}%; {count_text}); "
                 f"{partial} partial/incomplete, {active} waiting, {pending} pending. "
                 f"Elapsed {now - self.started:.0f}s.\nCurrent: {description} ({now - since:.0f}s).")
         if region:
@@ -926,6 +932,57 @@ def prompt_value(label: str, default: str) -> str:
     return value or default
 
 
+def print_status_help() -> None:
+    if hasattr(signal, "SIGINFO"):
+        print(f"Ctrl-T (SIGINFO) reports status immediately; also: kill -USR1 {os.getpid()}", flush=True)
+    elif hasattr(signal, "SIGUSR1"):
+        print(f"Immediate status: kill -USR1 {os.getpid()} (this system has no Ctrl-T/SIGINFO).", flush=True)
+
+
+def revalidate_existing_exports(cuboids: list[Cuboid], state: dict, export_dir: Path,
+                                reporter: RunStatus, verbose: bool = False) -> tuple[int, int, int, int]:
+    """Check saved files with visible progress and one index scan per file."""
+    started = time.monotonic()
+    print(f"Startup: checking saved exports for {len(cuboids)} selections in {export_dir}. "
+          "Existing files are parsed and validated before reuse.", flush=True)
+    complete = accepted = incomplete = absent = 0
+    last_output = started
+    for index, c in enumerate(cuboids, 1):
+        reporter.set_activity(f"Startup validation {index}/{len(cuboids)}: {c.name}", c)
+        now = time.monotonic()
+        if verbose or index == 1 or index % 10 == 0 or index == len(cuboids) or now - last_output >= 5:
+            print(f"Startup check {index}/{len(cuboids)}: {c.name} "
+                  f"({now - started:.0f}s elapsed)", flush=True)
+            last_output = now
+        output_path = export_dir / f"{c.name}.json"
+        previous = state["sections"].get(c.name, {})
+        if output_path.exists():
+            evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
+            problems = validate_export(output_path, c, evidence=evidence)
+            if not problems:
+                if previous.get("status") == "accepted":
+                    accepted += 1
+                else:
+                    complete += 1
+                    state["sections"][c.name] = validated_export_record(c, output_path, previous, evidence=evidence)
+            else:
+                incomplete += 1
+                if verbose:
+                    print("  Needs recovery: " + "; ".join(problems), flush=True)
+                if not (previous.get("segmented") or
+                        (previous.get("status") == "partial" and previous.get("gaps"))):
+                    state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
+        elif previous.get("status") in ("complete", "accepted") and not previous.get("segmented"):
+            state["sections"].pop(c.name, None)
+            absent += 1
+        else:
+            absent += 1
+        reporter.maybe_report()
+    print(f"Startup check finished in {time.monotonic() - started:.1f}s: "
+          f"{complete} verified, {accepted} accepted, {incomplete} need recovery, {absent} pending.", flush=True)
+    return complete, accepted, incomplete, absent
+
+
 def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path) -> int:
     report_activity("Starting coverage audit", clear_region=True)
     def progress(index, total, name):
@@ -995,6 +1052,7 @@ def _main(status_reporter: RunStatus) -> int:
             export_path = args.export_dir or state.get("signature", {}).get("export_dir")
             if not export_path:
                 parser.error("--export-dir is required until this plan has a saved run")
+            print_status_help()
             return write_plan_audit(plan, args.plan, state, Path(export_path).expanduser().resolve())
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))
@@ -1036,38 +1094,15 @@ def _main(status_reporter: RunStatus) -> int:
     print(f"Command files: {command_dir}")
     status_reporter.configure(cuboids, state)
     report_activity("Revalidating existing exports before collection", clear_region=True)
-    complete_now = accepted_now = incomplete_now = absent_now = 0
-    for c in cuboids:
-        output_path = export_dir / f"{c.name}.json"
-        previous = state["sections"].get(c.name, {})
-        if output_path.exists():
-            problems = validate_export(output_path, c)
-            if not problems:
-                if previous.get("status") == "accepted":
-                    accepted_now += 1
-                else:
-                    complete_now += 1
-                    state["sections"][c.name] = validated_export_record(c, output_path, previous)
-            else:
-                incomplete_now += 1
-                if not (previous.get("segmented") or
-                        (previous.get("status") == "partial" and previous.get("gaps"))):
-                    state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
-        elif (previous.get("status") in ("complete", "accepted") and not previous.get("segmented")):
-            state["sections"].pop(c.name, None)
-            absent_now += 1
-        else:
-            absent_now += 1
+    print_status_help()
+    complete_now, accepted_now, incomplete_now, absent_now = revalidate_existing_exports(
+        cuboids, state, export_dir, status_reporter, args.verbose)
     save_state(state_path, state)
     max_volume = max(c.size[0] * c.size[1] * c.size[2] for c in cuboids)
     print(f"Capture plan: {len(cuboids)} nonoverlapping cuboids; largest selection {max_volume:,} blocks.")
     print(f"Progress: {state_path}\nVerified {complete_now}; accepted {accepted_now}; incomplete {incomplete_now}; pending {absent_now}.")
     if not args.step_by_step:
         print("Ctrl-C pauses; r retries, q quits, a second Ctrl-C aborts.")
-    if hasattr(signal, "SIGINFO"):
-        print(f"Ctrl-T (SIGINFO) reports status immediately; also: kill -USR1 {os.getpid()}")
-    elif hasattr(signal, "SIGUSR1"):
-        print(f"Immediate status: kill -USR1 {os.getpid()} (this system has no Ctrl-T/SIGINFO).")
 
     original_sigint_handler = signal.getsignal(signal.SIGINT)
     try:

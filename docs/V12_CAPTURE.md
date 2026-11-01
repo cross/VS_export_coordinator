@@ -63,6 +63,19 @@ for a different capture prefix or Y interval. Changing the tmux pane/player
 does not invalidate geometric progress. Changing the export directory for an
 existing progress record is rejected instead of overwriting that record.
 
+Before collection, startup revalidates the saved export files to decide what
+can be reused. This parses their JSON, checks packed block/decor indices and
+column presence, and verifies retained rescan evidence and hashes. A large
+existing run can make this CPU-intensive; no server commands are sent during
+this pass. Successful validation evidence is reused when updating progress,
+so the block indices are scanned once per parent export during startup.
+
+The coordinator announces the startup check before reading exports, displays
+the selection number and elapsed time periodically (every selection with
+`--verbose`), and prints a completion summary. The PID/status-signal instructions
+appear before this pass. A status request identifies the exact startup file
+being checked, even between ordinary progress messages.
+
 ### Immediate status: Ctrl-T and signals
 
 On macOS/BSD, press **Ctrl-T** while the coordinator is running to request an
