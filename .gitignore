@@ -10,6 +10,8 @@ __pycache__/
 # Generated run checkpoints, previews, and audit reports
 *-progress.json
 *-audit.json
+*-exports.json
+*-files.txt
 *-preview.svg
 *.json.tmp
 

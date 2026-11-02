@@ -323,6 +323,7 @@ class Run:
         self.console,self.wait=console,wait
         self.verbose=False
         self.recovery_handler=None
+        self._announcement_open=False
         self.activity=activity or (lambda description,unit=None:None)
         self.units={unit['id']:unit for unit in state['units']}
         self.pairs=overlap_pairs(state['units'])
@@ -331,9 +332,22 @@ class Run:
             for name in (pair['left'],pair['right']):
                 self.incident[name].append(pair)
 
-    def announce(self,description,unit=None):
+    def end_announcement(self):
+        if self._announcement_open:
+            self._announcement_open=False
+            print(flush=True)
+
+    def announce(self,description,unit=None,*,end='\n'):
+        self.end_announcement()
         self.activity(description,unit)
-        print('  '+description,flush=True)
+        self._announcement_open=end!='\n'
+        print('  '+description,end=end,flush=True)
+
+    def primary_result(self,description,unit):
+        self.activity('Primary export: '+description,unit)
+        prefix='' if self._announcement_open else '  Primary export: '
+        self._announcement_open=False
+        print(prefix+description,flush=True)
 
     def section_attempt_limit(self,record):
         return max(self.state['attempt_limit'],record.get('manual_retry_limit',0))
@@ -447,7 +461,7 @@ class Run:
             try:
                 fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
-                raise CaptureError('Another controller is using this run; stop it before resuming or auditing')
+                raise CaptureError('Another controller is using this run; stop it before resuming, auditing, or listing exports')
             try:
                 stream.seek(0); stream.truncate(); stream.write(str(os.getpid())+'\n'); stream.flush()
                 # The checkpoint may have advanced between opening the run
@@ -479,6 +493,7 @@ class Run:
             if time.monotonic()>=deadline:
                 raise CaptureError('Chunk queues did not settle')
             if time.monotonic()-last_notice>=10:
+                self.end_announcement()
                 print('  Still waiting for chunk loading queues to clear ...',flush=True)
                 last_notice=time.monotonic()
             time.sleep(1)
@@ -514,7 +529,8 @@ class Run:
         self.save()
         return ref
 
-    def read_ref(self,ref):
+    def verified_ref_bytes(self,ref):
+        """Check recorded ownership and exact bytes without changing run state."""
         name=ref.get('file','')
         if (Path(name).name!=name or not name.startswith(self.state['prefix']+'_')
                 or ref.get('run_id')!=self.state['run_id']):
@@ -534,6 +550,14 @@ class Run:
         payload=path.read_bytes()
         if hashlib.sha256(payload).hexdigest()!=ref['sha256']:
             raise CaptureError('Export hash changed: '+name)
+        after=path.lstat()
+        if (after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=(info.st_size,info.st_mtime_ns,info.st_ctime_ns):
+            raise CaptureError('Export changed while being read: '+name)
+        return payload,info
+
+    def read_ref(self,ref):
+        payload,info=self.verified_ref_bytes(ref)
+        name=ref['file']; path=self.export_dir/name
         evidence=p.inspect_export(path,ref['requested'],self.plan['world_center'])
         after=path.lstat()
         if ((evidence.get('sha256') is not None and evidence['sha256']!=ref['sha256'])
@@ -615,8 +639,7 @@ class Run:
                 if len(record['attempts'])>1:
                     self.announce(f"Retrying whole selection (attempt {len(record['attempts'])}/{attempt_limit}): "
                                   'reload chunks, teleport, and export.',unit)
-                else:
-                    self.announce('Exporting primary selection (with chunk loading and teleport) ...',unit)
+                self.announce('Primary export (chunk load, teleport) ... ',unit,end='')
                 selected=self.capture(unit,unit['capture'],'section',attempt)
                 probes=[]
             if (selected['requested']!=unit['capture'] or selected['purpose']!='section'
@@ -634,6 +657,7 @@ class Run:
                 self.activity(f'Revalidating {len(probes)} saved deeper probes before planning any additional exports.',unit)
             for probe in probes:
                 pending-=self.check_probe(unit,selected,data,probe,pending)
+            needed_deeper=bool(pending)
             if pending:
                 rows=defaultdict(list)
                 for x,z in pending:
@@ -642,9 +666,8 @@ class Run:
                 if self.state['settings']['probe_ymin']>=unit['capture']['ymin']:
                     raise CaptureError('Probe Y minimum must be below the selection floor')
                 planned=list(chunk_bounds(boxes,self.state['settings']['probe_ymin'],unit['capture']['ymax']))
-                self.announce(f"Primary export: deeper confirmation needed for {count_label(len(pending),'column')}; "
-                              f"{count_label(len(planned),'probe')} at "
-                              f"Y={self.state['settings']['probe_ymin']}..{unit['capture']['ymax']}.",unit)
+                self.primary_result(f"complete; deeper scan needed for {count_label(len(pending),'column')}; "
+                                    f"{count_label(len(planned),'probe')}.",unit)
                 last_probe_notice=time.monotonic()
                 for index,bounds in enumerate(planned,1):
                     self.activity(f'Deeper probe {index}/{len(planned)}: {bounds_label(bounds)}.',unit)
@@ -672,18 +695,26 @@ class Run:
             if self.state.get('recovery',{}).get('unit')==unit['id']:
                 self.state['recovery']['status']='capture_validated'
             self.save()
-            summary=(f"primary export and {count_label(len(probes),'deeper probe')} validated; checkpoint saved"
-                     if self.verbose else 'validated and saved')
-            self.announce(f"Selection {unit['index']}/{len(self.units)} captured: {summary} "
-                          f'({time.monotonic()-started:.1f}s).',unit)
+            elapsed=time.monotonic()-started
+            if not candidate and not needed_deeper:
+                self.primary_result(f'validated ({elapsed:.1f}s).',unit)
+            else:
+                summary=(f"primary export and {count_label(len(probes),'deeper probe')} validated; checkpoint saved"
+                         if self.verbose else 'validated and saved')
+                self.announce(f"Selection {unit['index']}/{len(self.units)} captured: {summary} "
+                              f'({elapsed:.1f}s).',unit)
             return True
         except CompatibilityError as exc:
+            if self._announcement_open:
+                self.primary_result('stopped.',unit)
             record.update(status='incomplete',error=str(exc),selected=None)
             record['attempts'][-1].update(status='review_required',error=str(exc))
             self.save()
             self.announce(f"Attempt {len(record['attempts'])}/{attempt_limit} stopped for compatibility review: {exc}",unit)
             raise
         except (CaptureError,OSError,ValueError,TimeoutError,RuntimeError,subprocess.SubprocessError) as exc:
+            if self._announcement_open:
+                self.primary_result('failed.',unit)
             record.pop('candidate',None)
             record.update(status='incomplete',error=str(exc),selected=None)
             record['attempts'][-1].update(status='failed',error=str(exc))
@@ -691,6 +722,8 @@ class Run:
             self.announce(f"Attempt {len(record['attempts'])}/{attempt_limit} failed: {exc}. "
                           'The whole selection remains incomplete.',unit)
             return False
+        finally:
+            self.end_announcement()
 
     def seams(self):
         checks=[]
@@ -803,6 +836,9 @@ class Run:
             print(f'Starting capture of {len(self.units)} selections; no saved exports to revalidate.',flush=True)
             print('Plan: force-load chunks and teleport before each export; validate it, use deeper probes where column evidence is missing, '
                   'compare neighboring overlaps, then run the final audit.',flush=True)
+        ceilings=sorted({unit['capture']['ymax'] for unit in self.units.values()})
+        ceiling=str(ceilings[0]) if len(ceilings)==1 else 'the selection ceiling'
+        print(f"Deeper probes use Y={self.state['settings']['probe_ymin']}..{ceiling}.",flush=True)
         while True:
             while queue:
                 name=queue.popleft(); unit=self.units[name]

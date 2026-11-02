@@ -49,8 +49,8 @@ Continuation uses the saved source values unless explicit values are supplied
 to check against them.
 
 `--run-dir` and `--resume` are mutually exclusive. Choose at most one of
-`--preview`, `--prepare-only`, and `--report-coverage`. `--new-run` cannot be
-combined with `--resume`, `--preview`, or `--report-coverage`; it can be combined
+`--preview`, `--prepare-only`, `--report-coverage`, and `--list-exports`. `--new-run` cannot be
+combined with `--resume`, `--preview`, `--report-coverage`, or `--list-exports`; it can be combined
 with `--prepare-only` and a new `--run-dir`. Plain `--preview` writes the source
 plan's SVG without needing a run, player, export directory, log, or pane.
 `--prepare-only` needs source inputs for a new run but sends no commands.
@@ -138,6 +138,61 @@ terrain: the manifest deliberately retains failed and replaced files too.
 An interrupted, not-yet-certified primary appears under `candidate` until its
 column confirmations finish. Reports retain that pending candidate's file
 references but do not credit the whole selection prematurely.
+
+### Identify the files that belong to the captured dataset
+
+A filename prefix identifies the run, but includes failed, superseded, and
+abandoned exports. Revalidation creates no new WorldEdit exports; retries and
+commands interrupted before their results are adopted can leave extra files.
+Use the manifest-based inventory instead of globbing the WorldEdit directory:
+
+```sh
+python3 -B /path/to/vintage_story_export_coordinator.py \
+  --resume /tmp/primary-coastal-connection-v12-B --list-exports
+```
+
+Stop the collector before listing: the operation takes the same exclusive run
+lock as collection and auditing. It needs the saved export directory, but no
+tmux pane, online player, or live server log. `--plan PLAN --list-exports` can
+also discover a compatible run. Listing cannot create a new run and cannot be
+combined with another operation, `--new-run`, or `--max-attempts`.
+
+Four outputs are written inside the selected run directory:
+
+| File | Meaning |
+| --- | --- |
+| `RUN_ID-primary-files.txt` | Exactly the currently selected, validated primary terrain exports. Use this list for terrain processing; crop records to the corresponding core bounds. |
+| `RUN_ID-required-files.txt` | Those primaries plus their required deeper probes. Retain these together with the run directory for validation and provenance. Probes are supporting evidence and must not be merged as additional terrain. |
+| `RUN_ID-unused-files.txt` | Existing regular exports recorded as issued by this run but no longer selected or pending. These are review candidates for abandoned/superseded attempts; nothing is deleted automatically. |
+| `RUN_ID-exports.json` | Full inventory, including file hashes, core/capture bounds, pending candidates, unresolved selections, unknown files with this run prefix, and validation problems. |
+
+Text lists contain one filename per line, relative to the server's WorldEdit
+directory. They have no headings or comments. The JSON contains absolute paths,
+the exact checkpoint SHA256, and hashes for the generated lists.
+
+Inventory membership comes from **completed, validated attempts recorded in the
+checkpoint**, with fresh ownership, timestamp, and SHA256 checks for every
+selected primary and supporting probe. If any required file fails those checks,
+the whole selection is excluded from usable lists and reported as unresolved.
+Its files remain protected from the unused list. Pending candidates are also
+protected and reported separately, but excluded from the validated lists.
+Unrecognized files and other run IDs are never adopted or added to the unused
+list. Inspect each retained run separately when several runs share WorldEdit.
+
+This checks file integrity without reparsing millions of block records or
+rerunning coverage/overlap algorithms. It leaves the checkpoint and WorldEdit
+files unchanged. An unfinished run produces a **partial** validated dataset;
+`run_certified` is true only when its checkpoint already records final
+certification and all selected files still verify. Use `--report-coverage`
+for a fresh full audit or to refresh a stale checkpoint after detecting errors.
+Listing exits 0 when no selected-file problems were found (even for a partial
+run), 1 on verification/operational errors, 2 on invalid inputs, or 130 if
+interrupted. Rerun the inventory after further captures, retries, or file changes.
+
+The unused list is for review, not an automatic delete instruction. Before
+cleanup, ensure outstanding server exports have finished and retain any files
+needed for investigation. Keep selected primaries, their supporting probes,
+pending candidates, and unresolved references. There is no deletion command.
 
 Compatible full or partial runs are reusable automatically or through explicit
 `--resume`.
@@ -321,23 +376,30 @@ identifies the exact file being checked.
 
 Normal capture output is limited to useful milestones: one set of actual
 selection bounds and dimensions (with an overlap note), any deeper-confirmation
-plan, and a saved result with elapsed time. Before the first export starts, a
-short "Exporting primary selection ..." line announces the work, including
-chunk loading and teleporting. Its result follows after processing: either the
-deeper-confirmation plan or the saved completion result. Attempt numbers and
+plan, and a saved result with elapsed time. Before each primary export starts,
+`Primary export (chunk load, teleport) ... ` is printed without a newline and
+flushed immediately. This lists the loading actions in command order. Its result
+finishes the same line: `validated (3.7s).` after validation and checkpointing,
+or `complete; deeper scan needed for 102 columns; 2 probes.` before probing.
+A primary export that needs no probes has no additional completion summary.
+Attempt numbers and
 reload details appear only when another attempt becomes necessary. There
 are no separate success messages for chunk queues, file stability, hashing,
 each validation phase, original core bounds, or newly generated export paths.
 Those detailed phases still update the immediate status signal; filenames and
 bounds also remain in the saved run records and command files.
 
-When deeper evidence is needed, one line gives the column count, planned probe
-count, loading/teleport/export actions, and Y range. Normal output samples probe
+The deeper-probe Y range is stated once at collection startup. When deeper
+evidence is needed, the primary result gives the column count and planned probe
+count. Normal output samples probe
 progress after about 15 seconds between completed probes. `--verbose` prints
 exactly one short result for every successful completed probe. For three probes,
-a successful verbose selection normally occupies seven lines, plus at most one
-useful overlap summary. Verbose completion summaries retain the primary-export
-and deeper-probe counts; normal summaries use the shorter validated/saved result.
+a successful verbose selection normally occupies six lines, plus at most one
+useful overlap summary. After deeper probing, verbose completion summaries retain
+the primary-export and deeper-probe counts; normal summaries use the shorter
+validated/saved result. A prolonged chunk wait closes the unfinished line before
+printing its notice; the eventual primary result then gets its own labeled line.
+Interruptions and failures also close unfinished lines cleanly.
 Only `--verbose` reports successful overlap comparisons, explaining agreement
 of shared block records with neighboring exports and which remaining checks
 need neighboring captures. There is no summary if no neighboring export could

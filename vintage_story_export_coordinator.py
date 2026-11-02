@@ -25,6 +25,7 @@ from typing import Any
 import v12_capture_plan as capture_plan
 import server_console
 import capture_run
+import capture_inventory
 
 
 DEFAULT_PLAN = Path(__file__).resolve().parent / "capture-plans" / "coastal-connection" / "plan.json"
@@ -269,13 +270,17 @@ def build_parser() -> argparse.ArgumentParser:
   New runs need a player, an existing WorldEdit directory, and a readable
   server log. Omitted player/export directory values are prompted for;
   the log path is derived from the export directory unless supplied.
-  Preview, preparation, and reporting send no server commands.
+  Preview, preparation, reporting, and export inventories send no server commands.
 
   --run-dir and --resume are mutually exclusive.
-  --preview, --prepare-only, and --report-coverage are mutually exclusive.
-  --new-run cannot be combined with --resume, --preview, or --report-coverage;
+  --preview, --prepare-only, --report-coverage, and --list-exports are exclusive.
+  --new-run cannot be combined with --resume, --preview, --report-coverage,
+  or --list-exports;
   with --run-dir it requires a nonexistent or completely empty directory.
-  --report-coverage requires an existing compatible run.
+  --report-coverage and --list-exports require an existing compatible run.
+  --list-exports cannot be combined with --max-attempts; stop the collector
+  before listing. It checks hashes and writes file lists, leaving the checkpoint
+  and WorldEdit files unchanged. Partial runs produce partial validated lists.
   Exhausted automatic attempts pause for investigation on an interactive
   terminal: r authorizes one extra attempt, w extends the wait, q saves/quits.
   Timeout or noninteractive input stops with incomplete progress saved.
@@ -301,6 +306,7 @@ Examples:
   %(prog)s --target-pane PANE --export-dir DIRECTORY
   %(prog)s --run-dir RUN_DIRECTORY --prepare-only --export-dir DIRECTORY
   %(prog)s --resume RUN_DIRECTORY --report-coverage
+  %(prog)s --resume RUN_DIRECTORY --list-exports
 """)
     selection=parser.add_argument_group('plan and run selection')
     selection.add_argument('--plan',type=Path,metavar='FILE',
@@ -309,9 +315,9 @@ Examples:
     directories.add_argument('--run-dir',type=Path,metavar='DIR',
         help='initialize DIR if absent or completely empty; otherwise continue it only if compatible (default: discover a matching run, otherwise ./capture-runs/RUN_ID)')
     directories.add_argument('--resume',type=Path,metavar='DIR',
-        help='explicitly select an existing run for collection, preview, preparation, or audit (default: automatic discovery)')
+        help='explicitly select an existing run for collection, preview, preparation, audit, or export inventory (default: automatic discovery)')
     selection.add_argument('--new-run',action='store_true',
-        help='force a separate fresh run instead of automatic continuation (default: off); incompatible with --resume, --preview, and --report-coverage')
+        help='force a separate fresh run instead of automatic continuation (default: off); incompatible with --resume, --preview, --report-coverage, and --list-exports')
 
     operations=parser.add_argument_group('operation (default: collect and finish with an audit)')
     modes=operations.add_mutually_exclusive_group()
@@ -321,10 +327,12 @@ Examples:
         help='create/open a run, freeze new-run settings, write its padded preview, and exit; new runs still need player/export/log inputs, but no pane or tmux (default: off)')
     modes.add_argument('--report-coverage',action='store_true',
         help="audit an existing run's selected files, deeper confirmations, coverage and overlaps; write RUN_ID-audit.json and update its checkpoint; no pane or live log needed (default: off)")
+    modes.add_argument('--list-exports',action='store_true',
+        help='inventory an existing stopped run: recheck selected file hashes and write RUN_ID-exports.json plus primary/required/unused filename lists inside the run directory; excludes pending/unvalidated data; no pane or live log needed (default: off)')
 
     server=parser.add_argument_group('server and console')
     server.add_argument('--target-pane',metavar='PANE',
-        help='tmux pane containing the server console; REQUIRED for collection, unused for preview/preparation/reporting; no default')
+        help='tmux pane containing the server console; REQUIRED for collection, unused for preview/preparation/reporting/inventory; no default')
     server.add_argument('--tmux-binary',type=Path,metavar='PATH',
         help='tmux executable path for all collection commands (default: tmux from PATH); unused when no commands are sent')
     server.add_argument('--export-dir',type=Path,metavar='DIR',
@@ -346,9 +354,9 @@ Examples:
 
     interaction=parser.add_argument_group('collection output and interaction')
     interaction.add_argument('--verbose',action='store_true',
-        help='show each completed deeper probe, export/probe counts in results, successful comparisons of shared blocks with neighbors, saved-export filenames, and every final-audit selection (default: off); normal output samples long probe runs; detailed stages remain available through the status signal')
+        help='show each completed deeper probe, export/probe counts in results, successful shared-block comparisons, saved-export filenames, and every audit/inventory selection (default: off); normal output samples long probe runs; detailed stages remain available through the status signal')
     interaction.add_argument('--step-by-step',action='store_true',
-        help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; unused for preview/preparation/reporting (default: off)')
+        help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; collection only (default: off)')
     interaction.add_argument('--recovery-timeout',type=int,default=DEFAULT_RECOVERY_TIMEOUT,metavar='SECONDS',
         help=f'wait for a recovery decision after automatic attempts are exhausted (default: {DEFAULT_RECOVERY_TIMEOUT}s); 0 waits indefinitely; timeout saves and stops, noninteractive input stops immediately; collection only')
     return parser
@@ -366,13 +374,15 @@ def _main(status_reporter: RunStatus) -> int:
         if value is not None and (value<minimum or (maximum is not None and value>maximum)):
             constraint=f'{minimum}..{maximum}' if maximum is not None else f'>= {minimum}'
             parser.error(f'{option} must be {constraint}')
-    if args.new_run and (args.resume or args.report_coverage or args.preview):
-        parser.error('--new-run cannot be combined with --resume, --report-coverage, or --preview')
+    if args.new_run and (args.resume or args.report_coverage or args.preview or args.list_exports):
+        parser.error('--new-run cannot be combined with --resume, --report-coverage, --preview, or --list-exports')
+    if args.list_exports and args.max_attempts is not None:
+        parser.error('--list-exports cannot be combined with --max-attempts; inventory leaves the checkpoint unchanged')
     if args.new_run and args.run_dir:
         directory=args.run_dir.expanduser()
         if os.path.lexists(directory) and not capture_run.is_empty_directory(directory):
             parser.error('--new-run requires a nonexistent or completely empty run directory')
-    if not args.preview and not args.report_coverage and not args.prepare_only and not (args.target_pane or '').strip():
+    if not (args.preview or args.report_coverage or args.prepare_only or args.list_exports) and not (args.target_pane or '').strip():
         parser.error('--target-pane is required for collection')
     resuming=False
     try:
@@ -398,10 +408,11 @@ def _main(status_reporter: RunStatus) -> int:
                 candidates,blocked=capture_run.discover_runs(plan,plan_path,export_dir=args.export_dir,
                     server_log=args.server_log,player=args.player,
                     settings={'overlap':args.overlap,'coverage_y':args.coverage_y,'probe_ymin':args.rescan_y_min})
-                run=choose_compatible_run(candidates,blocked,allow_new=not args.report_coverage)
+                run=choose_compatible_run(candidates,blocked,allow_new=not (args.report_coverage or args.list_exports))
                 resuming=run is not None
-            if run is None and args.report_coverage:
-                parser.error('No compatible capture run found; --report-coverage requires an existing run manifest')
+            if run is None and (args.report_coverage or args.list_exports):
+                operation='--list-exports' if args.list_exports else '--report-coverage'
+                parser.error(f'No compatible capture run found; {operation} requires an existing run manifest')
             if run is None:
                 player=args.player or prompt_value('Player name for /executeas',DEFAULT_PLAYER)
                 export_dir=(args.export_dir or Path(prompt_value('WorldEdit export directory',str(Path.home()/'WorldEdit')))).expanduser().resolve()
@@ -440,7 +451,7 @@ def _main(status_reporter: RunStatus) -> int:
           f"{len(run.units)} raw selections; {run.state['settings']['overlap']}-block overlaps; "
           f"required coverage through Y={run.state['settings']['coverage_y']}.",flush=True)
     print_status_help()
-    if not (args.preview or args.prepare_only or args.report_coverage):
+    if not (args.preview or args.prepare_only or args.report_coverage or args.list_exports):
         if not Path(run.state['source']['server_log']).is_file() or not run.export_dir.is_dir():
             parser.error('Saved run server log/export directory is unavailable')
         binary=str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else 'tmux'
@@ -449,6 +460,16 @@ def _main(status_reporter: RunStatus) -> int:
     original_handler=signal.getsignal(signal.SIGINT)
     try:
         with run.locked():
+            if args.list_exports:
+                try:
+                    report=capture_inventory.write_inventory(run)
+                    return 1 if report['problems'] else 0
+                except KeyboardInterrupt:
+                    print('\nExport inventory interrupted; checkpoint and WorldEdit files are unchanged.',flush=True)
+                    return 130
+                except (OSError,ValueError,KeyError,TypeError) as exc:
+                    print(f'Export inventory failed: {exc}',file=sys.stderr,flush=True)
+                    return 1
             if resuming and args.max_attempts is not None:
                 if args.max_attempts < run.state['attempt_limit']:
                     raise capture_run.CaptureError('Retry budget advanced while opening the run; refusing to lower it')

@@ -246,6 +246,14 @@ class AutoResumeTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code,2)
         self.assertFalse(directory.exists())
 
+    def test_export_inventory_cannot_create_a_run_or_adopt_loose_exports(self):
+        (self.exports/(self.plan['cuboids'][0]['name']+'.json')).write_text('{}')
+        with patch('sys.stderr',new=io.StringIO()), patch.object(runs.Run,'create',side_effect=AssertionError('No new run')):
+            with self.assertRaises(SystemExit) as stopped:
+                self.invoke(['--plan',str(self.source),'--export-dir',str(self.exports),'--list-exports'])
+        self.assertEqual(stopped.exception.code,2)
+        self.assertFalse(self.index.exists())
+
 
 if __name__=='__main__':
     unittest.main()

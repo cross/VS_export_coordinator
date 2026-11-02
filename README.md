@@ -23,6 +23,8 @@ Repository layout:
 - `capture_run.py`: isolated capture runs, fresh immutable attempts, whole-section
   retries, deeper confirmations, and overlap/coverage certification. This is
   the default collection engine.
+- `capture_inventory.py`: manifest-based inventories of selected terrain files,
+  supporting probes, pending candidates, and unused export attempts.
 - `server_console.py`: console commands and acknowledgements from the server log.
 - `capture-plans/coastal-connection/`: current plan, coastline input, and
   changelog; Git retains earlier plan revisions.

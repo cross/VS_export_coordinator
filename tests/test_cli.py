@@ -36,7 +36,8 @@ class CliTests(unittest.TestCase):
                          'existing runs use their frozen plan','saved values when continuing',
                          'mutually exclusive','does not change exported Y bounds',
                          'VS_CAPTURE_RUN_INDEX','--recovery-timeout','default: 300s',
-                         'noninteractive input stops immediately'):
+                         'noninteractive input stops immediately','--list-exports',
+                         'primary/required/unused filename lists'):
             self.assertIn(expected,text)
         for option,value in (('--overlap',c.capture_run.DEFAULT_OVERLAP),
                              ('--coverage-y',c.capture_run.DEFAULT_COVERAGE_Y),
@@ -47,7 +48,7 @@ class CliTests(unittest.TestCase):
             self.assertIsNone(action.default)  # Omission must preserve saved values.
 
     def test_operation_modes_are_mutually_exclusive_before_side_effects(self):
-        for left,right in combinations(('--preview','--prepare-only','--report-coverage'),2):
+        for left,right in combinations(('--preview','--prepare-only','--report-coverage','--list-exports'),2):
             with self.subTest(left=left,right=right):
                 self.rejected([left,right],'not allowed with argument')
 
@@ -56,7 +57,7 @@ class CliTests(unittest.TestCase):
                       'not allowed with argument')
 
     def test_new_run_rejects_incompatible_modes_and_existing_directory(self):
-        for arguments in (['--resume','some-run'],['--preview'],['--report-coverage']):
+        for arguments in (['--resume','some-run'],['--preview'],['--report-coverage'],['--list-exports']):
             with self.subTest(arguments=arguments):
                 self.rejected(['--new-run',*arguments],'--new-run cannot be combined')
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +65,10 @@ class CliTests(unittest.TestCase):
                 stream.write('keep')
             self.rejected(['--new-run','--run-dir',directory,'--prepare-only'],
                           'nonexistent or completely empty run directory')
+
+    def test_export_inventory_cannot_change_retry_budget(self):
+        self.rejected(['--list-exports','--max-attempts','6'],
+                      '--list-exports cannot be combined with --max-attempts')
 
     def test_collection_requires_pane_before_reading_or_writing_run(self):
         self.rejected([],'--target-pane is required for collection')

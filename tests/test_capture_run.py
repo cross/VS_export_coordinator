@@ -112,7 +112,8 @@ class RunTests(unittest.TestCase):
             if '/chunk forceload ' in text:
                 counts['loading']+=1
                 self.assertEqual(sum(s.startswith('Loading export area:') for s in activities),counts['loading'])
-                self.assertEqual(output.getvalue().count('Exporting primary selection (with chunk loading and teleport) ...'),counts['loading'])
+                self.assertEqual(output.getvalue().count('Primary export (chunk load, teleport) ... '),counts['loading'])
+                self.assertTrue(output.getvalue().endswith('Primary export (chunk load, teleport) ... '))
             if '/we export ' in text:
                 counts['exporting']+=1
                 self.assertEqual(activities.count('Chunk load checks passed; selecting and exporting primary selection.'),counts['exporting'])
@@ -133,8 +134,9 @@ class RunTests(unittest.TestCase):
         self.assertNotIn('attempt 1/3',text)
         self.assertNotIn('Retrying whole selection',text)
         self.assertNotIn('captured: primary export and',text)
-        self.assertLess(text.index('Selection 1/2 captured:'),text.index('Selection 2/2:'))
-        self.assertIn('saved (',text)
+        self.assertRegex(text,r'Primary export \(chunk load, teleport\) \.\.\. validated \(\d+\.\d+s\)\.\nSelection 2/2:')
+        self.assertNotIn('Selection 1/2 captured:',text)
+        self.assertIn('Deeper probes use Y=0..67.',text)
         self.assertNotIn('Shared block records agree',text)
         self.assertNotIn('recording its hash',text)
         self.assertTrue(any(s.startswith('Hashing export:') for s in activities))
@@ -147,7 +149,7 @@ class RunTests(unittest.TestCase):
         output=io.StringIO(); check=run.check_probe; observed=[]
         def observed_check(unit,selected,data,probe,pending):
             if not observed:
-                self.assertIn('Primary export: deeper confirmation needed for 1 column; 1 probe at Y=0..67',output.getvalue())
+                self.assertIn('Primary export (chunk load, teleport) ... complete; deeper scan needed for 1 column; 1 probe.\n',output.getvalue())
                 self.assertTrue(any(s.startswith('Deeper probe 1/1: X 0..31, Y 0..67, Z 0..31') for s in activities))
                 self.assertTrue(any(s.startswith('Validating deeper probe 1/1 and comparing') for s in activities))
                 self.assertNotIn('Probe 1/1:',output.getvalue())
@@ -167,16 +169,18 @@ class RunTests(unittest.TestCase):
             self.assertEqual(run.collect(),0)
         text=output.getvalue()
         first=text[text.index('Selection 1/2:'):text.index('Selection 2/2:')]
-        self.assertEqual(len(first.strip().splitlines()),5)
+        self.assertEqual(len(first.strip().splitlines()),4)
         self.assertEqual(first.count('X 0..4, Y 65..67, Z 0..4'),1)
-        self.assertEqual(first.count('Primary export:'),1)
+        self.assertEqual(first.count('Primary export ('),1)
         self.assertEqual(first.count('Probe 1/1:'),1)
         self.assertNotIn('Shared block records agree',first)
         self.assertNotIn('attempt 1/3',first.lower())
         for redundant in ('Nonoverlapping core:','Export file:','File stable;',
                           'Export acknowledged;','Validating deeper probe','Checking the complete selection'):
             self.assertNotIn(redundant,first)
-        self.assertIn('Exporting primary selection (with chunk loading and teleport) ...',first)
+        self.assertIn('Primary export (chunk load, teleport) ... complete; deeper scan needed for 1 column; 1 probe.',first)
+        self.assertNotIn('Y=0..67',first)
+        self.assertEqual(text.count('Deeper probes use Y=0..67.'),1)
         self.assertIn('Shared block records agree with the neighboring export.',text)
         restored=runmod.Run.resume(run.directory); restored.verbose=True
         restored.console=FakeConsole(self.exports)
@@ -196,9 +200,9 @@ class RunTests(unittest.TestCase):
         text=output.getvalue()
         section=text[text.index('Selection 1/1:'):text.index('Final audit:')]
         lines=section.strip().splitlines()
-        self.assertEqual(len(lines),7)
+        self.assertEqual(len(lines),6)
         self.assertEqual(sum(line.strip().startswith('Probe ') for line in lines),3)
-        self.assertEqual(section.count('Primary export:'),1)
+        self.assertEqual(section.count('Primary export ('),1)
         self.assertNotIn('Shared block records agree',section)
         self.assertIn('primary export and 3 deeper probes validated; checkpoint saved',section)
         self.assertNotIn('attempt 1/3',section.lower())
@@ -242,7 +246,41 @@ class RunTests(unittest.TestCase):
         self.assertIn('Attempt 1/3 failed:',text)
         self.assertIn('The whole selection remains incomplete.',text)
         self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Retrying whole selection (attempt 2/3)'))
-        self.assertLess(text.index('Retrying whole selection (attempt 2/3)'),text.index('Selection 1/2 captured:'))
+        self.assertLess(text.index('Retrying whole selection (attempt 2/3)'),text.index('... validated ('))
+
+    def test_primary_failure_finishes_its_line_before_the_failure_details(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        output=io.StringIO()
+        with patch.object(run.console,'command',side_effect=RuntimeError('server unavailable')), patch('sys.stdout',new=output):
+            self.assertFalse(run.capture_section(run.state['units'][0]))
+        self.assertIn('Primary export (chunk load, teleport) ... failed.\n  Attempt 1/3 failed: server unavailable.',output.getvalue())
+        self.assertFalse(run._announcement_open)
+
+    def test_chunk_wait_notice_keeps_the_result_on_a_separate_clean_line(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        command=run.console.command; clock=[0.0]; delayed=[False]
+        def queues(command_text,*args,**kwargs):
+            if '/chunk cit' in command_text and not delayed[0]:
+                delayed[0]=True; clock[0]=11.0
+                return 'Chunk in genQ: True, chunkReq in Q: True'
+            return command(command_text,*args,**kwargs)
+        output=io.StringIO()
+        with patch.object(run.console,'command',side_effect=queues), patch('sys.stdout',new=output), \
+                patch.object(runmod.time,'monotonic',side_effect=lambda:clock[0]), patch.object(runmod.time,'sleep'):
+            self.assertTrue(run.capture_section(run.state['units'][0]))
+        self.assertEqual(output.getvalue(),
+            '  Primary export (chunk load, teleport) ... \n'
+            '  Still waiting for chunk loading queues to clear ...\n'
+            '  Primary export: validated (11.0s).\n')
+
+    def test_interruption_closes_the_unfinished_primary_line(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        output=io.StringIO()
+        with patch.object(run.console,'command',side_effect=KeyboardInterrupt), patch('sys.stdout',new=output):
+            with self.assertRaises(KeyboardInterrupt):
+                run.capture_section(run.state['units'][0])
+        self.assertEqual(output.getvalue(),'  Primary export (chunk load, teleport) ... \n')
+        self.assertFalse(run._announcement_open)
 
     def test_partial_run_resumes_completed_selection_without_recapturing_it(self):
         run=self.create(); run.console=FakeConsole(self.exports)
