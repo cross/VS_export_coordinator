@@ -25,6 +25,10 @@ import v12_capture_plan as p
 SCHEMA = 'coast-capture-run/3'
 OPERATIONAL_MODEL = 'fresh-loaded-whole-section-with-overlaps/1'
 INDEX_SCHEMA = 'coast-capture-run-index/1'
+DEFAULT_OVERLAP = 3
+DEFAULT_COVERAGE_Y = 109
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_PROBE_YMIN = 0
 
 
 class CaptureError(ValueError):
@@ -39,6 +43,11 @@ def atomic_json(path, value):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n')
     temporary.replace(path)
+
+
+def is_empty_directory(path):
+    path=Path(path)
+    return path.is_dir() and next(path.iterdir(),None) is None
 
 
 def run_index_path():
@@ -308,14 +317,17 @@ class Run:
 
     @classmethod
     def create(cls, plan, plan_path, export_dir, server_log, player, directory=None,
-               overlap=3, coverage_y=109, max_attempts=3, probe_ymin=0, **kwargs):
+               overlap=DEFAULT_OVERLAP, coverage_y=DEFAULT_COVERAGE_Y,
+               max_attempts=DEFAULT_MAX_ATTEMPTS, probe_ymin=DEFAULT_PROBE_YMIN, **kwargs):
         p.verify_plan(plan)
         if type(max_attempts) is not int or max_attempts < 1:
             raise CaptureError('Maximum attempts must be positive')
+        if any(type(value) is not int or value < 0 for value in (coverage_y, probe_ymin)):
+            raise CaptureError('Coverage Y and probe Y minimum must be nonnegative integers')
         run_id=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid.uuid4().hex[:12]
         directory=Path(directory) if directory else Path.cwd()/'capture-runs'/run_id
-        if directory.exists():
-            raise CaptureError('Run directory already exists; choose a new directory or use --resume: '+str(directory))
+        if os.path.lexists(directory) and not is_empty_directory(directory):
+            raise CaptureError('Run directory already exists and is not empty; choose an empty/new directory or use --resume: '+str(directory))
         units=run_units(plan,overlap)
         state={'schema':SCHEMA,'operational_model':OPERATIONAL_MODEL,'run_id':run_id,'prefix':'v12_capture_'+run_id,
                'plan_hash':plan['plan_hash'],'geometry_hash':plan['geometry_hash'],
@@ -327,11 +339,18 @@ class Run:
                'coverage_complete':None,'overlap_complete':None,'files_verified':None,'audit_status':'not_run'}
         definition=p.digest({key:state[key] for key in ('operational_model','run_id','prefix','plan_hash','geometry_hash','source','settings','units')})
         state['definition_hash']=definition
-        directory.mkdir(parents=True)
-        atomic_json(directory/'plan.json',plan)
-        atomic_json(directory/'run.json',{'schema':SCHEMA,'run_id':run_id,'plan_hash':plan['plan_hash'],
-                                        'operational_model':OPERATIONAL_MODEL,
-                                        'progress_file':run_id+'-progress.json','definition_hash':definition})
+        directory.mkdir(parents=True,exist_ok=True)
+        if not is_empty_directory(directory):
+            raise CaptureError('Run directory is no longer empty; refusing to initialize it: '+str(directory))
+        # Claim initialization before writing any other files. Concurrent
+        # creators cannot replace each other's run identity or frozen plan.
+        identity={'schema':SCHEMA,'run_id':run_id,'plan_hash':plan['plan_hash'],
+                  'operational_model':OPERATIONAL_MODEL,
+                  'progress_file':run_id+'-progress.json','definition_hash':definition}
+        with (directory/'run.json').open('x') as stream:
+            stream.write(json.dumps(identity,indent=2)+'\n')
+        with (directory/'plan.json').open('x') as stream:
+            stream.write(json.dumps(plan,indent=2)+'\n')
         run=cls(directory,plan,state,**kwargs)
         run.save()
         run.preview()

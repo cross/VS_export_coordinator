@@ -62,6 +62,57 @@ class AutoResumeTests(unittest.TestCase):
         self.assertEqual(result,0)
         self.assertEqual(runs.Run.resume(directory).state['run_id'],original.state['run_id'])
 
+    def test_empty_run_directory_starts_new_run_with_or_without_new_run_flag(self):
+        for flag in ([],['--new-run']):
+            with self.subTest(flag=flag):
+                directory=self.root/('explicit-fresh' if flag else 'empty-run')
+                directory.mkdir()
+                result,_=self.invoke(['--plan',str(self.source),'--run-dir',str(directory),
+                    '--prepare-only','--player','Player','--export-dir',str(self.exports),
+                    '--server-log',str(self.log),*flag])
+                self.assertEqual(result,0)
+                restored=runs.Run.resume(directory)
+                self.assertEqual(restored.state['sections'],{})
+                self.assertEqual(restored.plan,self.plan)
+
+    def test_emptied_former_run_directory_gets_new_identity(self):
+        directory=self.root/'recycled'
+        original=self.prepare(directory)
+        for path in directory.iterdir():
+            path.unlink()
+        replacement=self.prepare(directory)
+        self.assertNotEqual(original.state['run_id'],replacement.state['run_id'])
+        self.assertEqual(replacement.state['sections'],{})
+
+    def test_nonempty_unrecognized_directory_is_rejected_without_changes(self):
+        for name in ('.hidden','unrelated.json','subdirectory'):
+            with self.subTest(name=name):
+                directory=self.root/name.removeprefix('.')
+                directory.mkdir()
+                entry=directory/name
+                if name=='subdirectory':
+                    entry.mkdir()
+                else:
+                    entry.write_text('keep')
+                args=['--plan',str(self.source),'--run-dir',str(directory),'--prepare-only']
+                with patch('sys.stderr',new=io.StringIO()), patch.object(runs.Run,'create',side_effect=AssertionError('Not empty')):
+                    with self.assertRaises(SystemExit) as stopped:
+                        self.invoke(args)
+                self.assertEqual(stopped.exception.code,2)
+                self.assertEqual(list(directory.iterdir()),[entry])
+                if entry.is_file():
+                    self.assertEqual(entry.read_text(),'keep')
+
+    def test_empty_directory_cannot_be_resumed_or_audited_as_a_run(self):
+        directory=self.root/'empty'; directory.mkdir()
+        for args in (['--resume',str(directory),'--prepare-only'],
+                     ['--plan',str(self.source),'--run-dir',str(directory),'--report-coverage']):
+            with self.subTest(args=args), patch('sys.stderr',new=io.StringIO()):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.invoke(args)
+                self.assertEqual(stopped.exception.code,2)
+                self.assertEqual(list(directory.iterdir()),[])
+
     def test_unindexed_local_manifest_is_discovered_and_registered(self):
         directory=self.source.parent/'planA-run'
         original=runs.Run.create(self.plan,self.source,self.exports,self.log,'Player',directory=directory,coverage_y=66)
@@ -78,6 +129,27 @@ class AutoResumeTests(unittest.TestCase):
         entry=runs.read_run_index()['runs'][0]
         self.assertEqual(Path(entry['directory']).parent,(self.workspace/'capture-runs').resolve())
         self.assertEqual(list(self.source.parent.iterdir()),[self.source])
+
+    def test_new_run_derives_default_log_from_export_directory(self):
+        default_log=self.exports.parent/'Logs'/'server-main.log'
+        default_log.parent.mkdir(); default_log.touch()
+        result,_=self.invoke(['--plan',str(self.source),'--prepare-only','--player','Player',
+                             '--export-dir',str(self.exports)])
+        self.assertEqual(result,0)
+        entry=runs.read_run_index()['runs'][0]
+        run=runs.Run.resume(entry['directory'])
+        self.assertEqual(run.state['source']['server_log'],str(default_log.resolve()))
+        self.assertEqual(run.state['settings'],dict(overlap=3,coverage_y=109,max_attempts=3,probe_ymin=0))
+
+    def test_explicit_retry_budget_raise_is_honored_in_existing_run_offline_modes(self):
+        for mode in ('--prepare-only','--preview'):
+            with self.subTest(mode=mode):
+                original=self.prepare(self.root/mode.removeprefix('--'))
+                result,_=self.invoke(['--resume',str(original.directory),mode,'--max-attempts','5'])
+                self.assertEqual(result,0)
+                restored=runs.Run.resume(original.directory)
+                self.assertEqual(restored.state['attempt_limit'],5)
+                self.assertEqual(restored.state['settings']['max_attempts'],3)
 
     def test_new_run_flag_is_explicit_fresh_capture_and_retains_original(self):
         original=self.prepare(self.root/'first')

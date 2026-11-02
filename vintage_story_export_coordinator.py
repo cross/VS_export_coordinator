@@ -17,6 +17,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from typing import Any
 
@@ -201,40 +202,124 @@ def choose_compatible_run(runs,blocked,*,allow_new=True):
     return None
 
 
+class HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    def _split_lines(self, text, width):
+        return textwrap.wrap(' '.join(text.split()),width,
+                             break_long_words=False,break_on_hyphens=False)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser=argparse.ArgumentParser(
+        description="Capture a saved plan using loaded WorldEdit exports, whole-section retries, and overlap checks.",
+        formatter_class=HelpFormatter,
+        epilog="""Requirements and combinations:
+  Collection is the default mode; only collection requires --target-pane.
+  New runs need a player, an existing WorldEdit directory, and a readable
+  server log. Omitted player/export directory values are prompted for;
+  the log path is derived from the export directory unless supplied.
+  Preview, preparation, and reporting send no server commands.
+
+  --run-dir and --resume are mutually exclusive.
+  --preview, --prepare-only, and --report-coverage are mutually exclusive.
+  --new-run cannot be combined with --resume, --preview, or --report-coverage;
+  with --run-dir it requires a nonexistent or completely empty directory.
+  --report-coverage requires an existing compatible run.
+
+Continuation and defaults:
+  Without an explicit run directory, continue the compatible run matching
+  the plan and supplied server/player/settings; multiple matches prompt.
+  If no run matches, create ./capture-runs/RUN_ID relative to cwd.
+  Omitted source/policy options use saved values when continuing a run.
+  Supplied player, export directory, server log, overlap, coverage Y, and probe
+  floor must match that run. The retry limit may be raised but never lowered.
+  Capture-policy options do not change the source plan or its export Y bounds;
+  they have no effect on a standalone --preview of the source plan.
+
+Paths and output:
+  Relative paths resolve from cwd; the default source plan is beside the script.
+  Exports stay in the server's actual WorldEdit directory. The run directory
+  holds its frozen plan, manifest, progress, commands, preview, and audit.
+  Run index: $XDG_STATE_HOME/vintage-story-export-coordinator/runs.json
+  Default XDG_STATE_HOME: ~/.local/state. VS_CAPTURE_RUN_INDEX overrides the file.
+
+Examples:
+  %(prog)s --target-pane PANE --export-dir DIRECTORY
+  %(prog)s --run-dir RUN_DIRECTORY --prepare-only --export-dir DIRECTORY
+  %(prog)s --resume RUN_DIRECTORY --report-coverage
+""")
+    selection=parser.add_argument_group('plan and run selection')
+    selection.add_argument('--plan',type=Path,metavar='FILE',
+        help='source plan (default: capture-plans/coastal-connection/plan.json beside this script); existing runs use their frozen plan; an explicit FILE must match it')
+    directories=selection.add_mutually_exclusive_group()
+    directories.add_argument('--run-dir',type=Path,metavar='DIR',
+        help='initialize DIR if absent or completely empty; otherwise continue it only if compatible (default: discover a matching run, otherwise ./capture-runs/RUN_ID)')
+    directories.add_argument('--resume',type=Path,metavar='DIR',
+        help='explicitly select an existing run for collection, preview, preparation, or audit (default: automatic discovery)')
+    selection.add_argument('--new-run',action='store_true',
+        help='force a separate fresh run instead of automatic continuation (default: off); incompatible with --resume, --preview, and --report-coverage')
+
+    operations=parser.add_argument_group('operation (default: collect and finish with an audit)')
+    modes=operations.add_mutually_exclusive_group()
+    modes.add_argument('--preview',action='store_true',
+        help="render source-plan cores to FILE.svg beside the plan; with an existing --run-dir/--resume, render that run's padded mosaic inside its directory; then exit (default: off)")
+    modes.add_argument('--prepare-only',action='store_true',
+        help='create/open a run, freeze new-run settings, write its padded preview, and exit; new runs still need player/export/log inputs, but no pane or tmux (default: off)')
+    modes.add_argument('--report-coverage',action='store_true',
+        help="audit an existing run's selected files, deeper confirmations, coverage and overlaps; write RUN_ID-audit.json and update its checkpoint; no pane or live log needed (default: off)")
+
+    server=parser.add_argument_group('server and console')
+    server.add_argument('--target-pane',metavar='PANE',
+        help='tmux pane containing the server console; REQUIRED for collection, unused for preview/preparation/reporting; no default')
+    server.add_argument('--tmux-binary',type=Path,metavar='PATH',
+        help='tmux executable path for all collection commands (default: tmux from PATH); unused when no commands are sent')
+    server.add_argument('--export-dir',type=Path,metavar='DIR',
+        help='actual server WorldEdit output directory, which must already exist; does not redirect server output (new runs: prompt, default ~/WorldEdit; continuing runs: saved directory)')
+    server.add_argument('--server-log',type=Path,metavar='FILE',
+        help='log for command acknowledgements (new runs: ../Logs/server-main.log relative to --export-dir; continuing runs: saved log path); readable log required to create or collect a run')
+    server.add_argument('--player',metavar='NAME',
+        help=f'player used by /executeas and teleports; must be online with creative mode and command permissions for collection (new runs: prompt, default {DEFAULT_PLAYER}; continuing runs: saved player)')
+
+    policy=parser.add_argument_group('capture policy (new-run defaults below; continuation uses saved values)')
+    policy.add_argument('--overlap',type=int,metavar='BLOCKS',
+        help=f'east/south padding for neighboring export comparisons, 1..16 (new-run default: {capture_run.DEFAULT_OVERLAP}); may subdivide cores to obey selection limits')
+    policy.add_argument('--coverage-y',type=int,metavar='Y',
+        help=f"required surface/column confirmation height, nonnegative and clamped to each selection's Y range (new-run default: {capture_run.DEFAULT_COVERAGE_Y}); does not change exported Y bounds")
+    policy.add_argument('--max-attempts',type=int,metavar='N',
+        help=f'total whole-section attempt limit per selection, including previous attempts, N >= 1 (new-run default: {capture_run.DEFAULT_MAX_ATTEMPTS}); continuing runs may only raise it')
+    policy.add_argument('--rescan-y-min',type=int,metavar='Y',
+        help=f'nonnegative floor for automatic deeper confirmation probes (new-run default: {capture_run.DEFAULT_PROBE_YMIN}); when needed, probes must start below the selection floor and fit selection limits')
+
+    interaction=parser.add_argument_group('collection output and interaction')
+    interaction.add_argument('--verbose',action='store_true',
+        help='show every saved-selection reuse check during collection instead of periodic summaries (default: off)')
+    interaction.add_argument('--step-by-step',action='store_true',
+        help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; unused for preview/preparation/reporting (default: off)')
+    return parser
+
+
 def _main(status_reporter: RunStatus) -> int:
-    parser=argparse.ArgumentParser(description="Collect isolated, fresh WorldEdit exports with coverage and seam checks.")
-    parser.add_argument('--plan',type=Path)
-    parser.add_argument('--run-dir',type=Path,help='run directory: create if new, continue if compatible')
-    parser.add_argument('--resume',type=Path,help='explicitly resume/audit an isolated run directory')
-    parser.add_argument('--new-run',action='store_true',help='start a fresh run instead of automatically continuing a compatible one')
-    parser.add_argument('--target-pane')
-    parser.add_argument('--tmux-binary',type=Path)
-    parser.add_argument('--export-dir',type=Path)
-    parser.add_argument('--server-log',type=Path)
-    parser.add_argument('--player')
-    parser.add_argument('--overlap',type=int,default=None,help='east/south overlap blocks (new runs: 3)')
-    parser.add_argument('--coverage-y',type=int,default=None,help='required coverage height (new runs: 109)')
-    parser.add_argument('--max-attempts',type=int,default=None,help='whole-section attempt limit (new runs: 3)')
-    parser.add_argument('--rescan-y-min',type=int,default=None)
-    parser.add_argument('--preview',action='store_true')
-    parser.add_argument('--prepare-only',action='store_true',help='create an isolated run and preview, then exit before sending commands')
-    parser.add_argument('--report-coverage',action='store_true')
-    parser.add_argument('--verbose',action='store_true')
-    parser.add_argument('--step-by-step',action='store_true')
+    parser=build_parser()
     args=parser.parse_args()
-    if args.resume and args.run_dir:
-        parser.error('--resume and --run-dir are mutually exclusive')
-    if sum((args.preview,args.prepare_only,args.report_coverage))>1:
-        parser.error('Choose only one of --preview, --prepare-only, or --report-coverage')
+    for option,value,minimum,maximum in (
+            ('--overlap',args.overlap,1,16),
+            ('--coverage-y',args.coverage_y,0,None),
+            ('--max-attempts',args.max_attempts,1,None),
+            ('--rescan-y-min',args.rescan_y_min,0,None)):
+        if value is not None and (value<minimum or (maximum is not None and value>maximum)):
+            constraint=f'{minimum}..{maximum}' if maximum is not None else f'>= {minimum}'
+            parser.error(f'{option} must be {constraint}')
     if args.new_run and (args.resume or args.report_coverage or args.preview):
         parser.error('--new-run cannot be combined with --resume, --report-coverage, or --preview')
-    if args.new_run and args.run_dir and args.run_dir.expanduser().exists():
-        parser.error('--new-run requires a run directory that does not already exist')
+    if args.new_run and args.run_dir:
+        directory=args.run_dir.expanduser()
+        if os.path.lexists(directory) and not capture_run.is_empty_directory(directory):
+            parser.error('--new-run requires a nonexistent or completely empty run directory')
     if not args.preview and not args.report_coverage and not args.prepare_only and not (args.target_pane or '').strip():
         parser.error('--target-pane is required for collection')
     resuming=False
     try:
-        explicit=args.resume or (args.run_dir if args.run_dir and args.run_dir.expanduser().exists() else None)
+        explicit=args.resume or (args.run_dir if args.run_dir and os.path.lexists(args.run_dir.expanduser())
+                                and not capture_run.is_empty_directory(args.run_dir.expanduser()) else None)
         if explicit:
             run=capture_run.Run.resume(explicit,export_dir=args.export_dir,server_log=args.server_log,player=args.player)
             resuming=True
@@ -267,10 +352,10 @@ def _main(status_reporter: RunStatus) -> int:
                     parser.error('Collection requires the actual server WorldEdit directory and readable --server-log')
                 run=capture_run.Run.create(plan,plan_path,export_dir,server_log,player,
                     directory=args.run_dir.expanduser().resolve() if args.run_dir else None,
-                    overlap=3 if args.overlap is None else args.overlap,
-                    coverage_y=109 if args.coverage_y is None else args.coverage_y,
-                    max_attempts=3 if args.max_attempts is None else args.max_attempts,
-                    probe_ymin=0 if args.rescan_y_min is None else args.rescan_y_min)
+                    overlap=capture_run.DEFAULT_OVERLAP if args.overlap is None else args.overlap,
+                    coverage_y=capture_run.DEFAULT_COVERAGE_Y if args.coverage_y is None else args.coverage_y,
+                    max_attempts=capture_run.DEFAULT_MAX_ATTEMPTS if args.max_attempts is None else args.max_attempts,
+                    probe_ymin=capture_run.DEFAULT_PROBE_YMIN if args.rescan_y_min is None else args.rescan_y_min)
         if resuming:
             for key,value in (('overlap',args.overlap),('coverage_y',args.coverage_y),('probe_ymin',args.rescan_y_min)):
                 if value is not None and value!=run.state['settings'][key]:
@@ -295,10 +380,7 @@ def _main(status_reporter: RunStatus) -> int:
           f"{len(run.units)} raw selections; {run.state['settings']['overlap']}-block overlaps; "
           f"required coverage through Y={run.state['settings']['coverage_y']}.",flush=True)
     print_status_help()
-    if args.preview or args.prepare_only:
-        run.preview()
-        return 0
-    if not args.report_coverage:
+    if not (args.preview or args.prepare_only or args.report_coverage):
         if not Path(run.state['source']['server_log']).is_file() or not run.export_dir.is_dir():
             parser.error('Saved run server log/export directory is unavailable')
         binary=str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else 'tmux'
@@ -312,6 +394,9 @@ def _main(status_reporter: RunStatus) -> int:
                     raise capture_run.CaptureError('Retry budget advanced while opening the run; refusing to lower it')
                 run.state['attempt_limit']=args.max_attempts
                 run.save()
+            if args.preview or args.prepare_only:
+                run.preview()
+                return 0
             while True:
                 try:
                     if args.report_coverage:

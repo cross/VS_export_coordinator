@@ -171,6 +171,46 @@ class RunTests(unittest.TestCase):
         with self.assertRaisesRegex(runmod.CaptureError,'already exists'):
             self.create()
 
+    def test_create_accepts_empty_directory_but_refuses_any_entries(self):
+        empty=self.root/'empty'; empty.mkdir()
+        run=self.create('empty')
+        self.assertEqual(run.directory,empty)
+        self.assertEqual(runmod.Run.resume(empty).state['run_id'],run.state['run_id'])
+        for index,name in enumerate(('.hidden','unrelated.json','subdirectory')):
+            directory=self.root/f'occupied{index}'; directory.mkdir()
+            entry=directory/name
+            if name=='subdirectory':
+                entry.mkdir()
+            else:
+                entry.write_text('keep')
+            with self.subTest(name=name), self.assertRaisesRegex(runmod.CaptureError,'not empty'):
+                self.create(directory.name)
+            self.assertEqual(list(directory.iterdir()),[entry])
+
+    def test_initialization_cannot_replace_identity_created_by_concurrent_writer(self):
+        directory=self.root/'racing'; directory.mkdir()
+        original_open=Path.open
+        def open_with_concurrent_identity(path,mode='r',*args,**kwargs):
+            if path==directory/'run.json' and mode=='x':
+                with original_open(path,'w') as stream:
+                    stream.write('other writer')
+            return original_open(path,mode,*args,**kwargs)
+        with patch.object(Path,'open',new=open_with_concurrent_identity):
+            with self.assertRaises(FileExistsError):
+                self.create('racing')
+        self.assertEqual((directory/'run.json').read_text(),'other writer')
+        self.assertFalse((directory/'plan.json').exists())
+
+    def test_invalid_policy_inputs_cannot_create_a_run_directory(self):
+        for index,settings in enumerate(({'coverage_y':-1},{'probe_ymin':-1},
+                                         {'coverage_y':1.5},{'max_attempts':0},{'overlap':17})):
+            with self.subTest(settings=settings):
+                directory=self.root/f'invalid{index}'
+                with self.assertRaises(runmod.CaptureError):
+                    runmod.Run.create(self.plan,self.root/'source.json',self.exports,self.log,'Player',
+                                      directory=directory,**settings)
+                self.assertFalse(directory.exists())
+
     def test_run_lock_refuses_second_writer_and_reloads_latest_checkpoint(self):
         run=self.create(); other=runmod.Run.resume(run.directory)
         with run.locked():

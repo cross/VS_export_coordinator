@@ -28,7 +28,7 @@ settings, records unique raw export attempts, and verifies loading, column
 coverage, and agreement between overlapping selections. Only current-format
 run manifests can be resumed or audited.
 
-Start the first run using a directory that does not yet exist:
+Start the first run using a directory that does not yet exist or is completely empty:
 
 ```sh
 python3 -B /path/to/vintage_story_export_coordinator.py \
@@ -39,11 +39,39 @@ python3 -B /path/to/vintage_story_export_coordinator.py \
   --server-log /path/to/server/data/Logs/server-main.log
 ```
 
+`--help` lists all options, defaults, requirements, and combinations. Collection
+is the default operation, and `--target-pane` is required only when collecting.
+For a new run, omitted `--player` prompts with `Xplosionist` as the default;
+omitted `--export-dir` prompts with `~/WorldEdit`. Omitted `--server-log` uses
+`../Logs/server-main.log` relative to the export directory. The export directory
+must exist and the log must be readable when creating or collecting a run.
+Continuation uses the saved source values unless explicit values are supplied
+to check against them.
+
+`--run-dir` and `--resume` are mutually exclusive. Choose at most one of
+`--preview`, `--prepare-only`, and `--report-coverage`. `--new-run` cannot be
+combined with `--resume`, `--preview`, or `--report-coverage`; it can be combined
+with `--prepare-only` and a new `--run-dir`. Plain `--preview` writes the source
+plan's SVG without needing a run, player, export directory, log, or pane.
+`--prepare-only` needs source inputs for a new run but sends no commands.
+`--report-coverage` needs an existing compatible run and its export files, but
+no active console, player, or server log.
+
+New-run policy defaults are `--overlap 3`, `--coverage-y 109`, `--max-attempts 3`,
+and `--rescan-y-min 0`. Overlap must be 1–16, the attempt limit must be positive,
+and coverage/probe Y values must be nonnegative integers. Required confirmation
+height is clamped to each selection's Y range and does not change its requested
+export bounds. The program rejects invalid numeric values before prompting or
+creating a run. `--step-by-step` prompts before primary captures and retries;
+loading and any deeper probes remain automatic.
+
 Repeat that command to continue after an interruption. You can also omit
 `--run-dir` on restart: the coordinator remembers custom run directories and
 automatically continues the one compatible run matching the plan and supplied
-server/player/settings. Repeating an existing `--run-dir` continues that run
-after compatibility checks. A completed run remains reusable too.
+server/player/settings. Repeating a nonempty `--run-dir` continues that run
+after compatibility checks. An existing empty directory starts a new run;
+hidden files and subdirectories count as contents, so even those entries
+prevent new-run initialization. A completed run remains reusable too.
 
 Add `--prepare-only` to create the run, freeze its plan, and render its capture
 preview without sending commands. After reviewing the preview, repeat the
@@ -71,8 +99,9 @@ adopted by filename. Plan-only `--preview` renders the planned cores; use
 padded mosaic.
 
 Use `--new-run` to deliberately start a separate capture of the same plan.
-It bypasses automatic continuation and requires a new directory if `--run-dir`
-is supplied. Prior runs and their exports remain untouched. If several runs
+It bypasses automatic continuation and requires a nonexistent or completely
+empty directory if `--run-dir` is supplied. Prior runs and their exports remain
+untouched. If several runs
 match, the coordinator asks which to continue rather than guessing. Supplying
 `--export-dir`, `--server-log`, or `--player` narrows the search. If a matching
 run is incompatible or unreadable and no compatible run exists, the coordinator
