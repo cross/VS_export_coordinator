@@ -3,8 +3,10 @@ from copy import deepcopy
 import io
 import json
 import os
+import shlex
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -140,7 +142,7 @@ class RunTests(unittest.TestCase):
         self.assertNotIn('Shared block records agree',text)
         self.assertNotIn('recording its hash',text)
         self.assertTrue(any(s.startswith('Hashing export:') for s in activities))
-        self.assertLess(text.index('Final audit: rechecking'),text.index('Auditing run selection 1/2'))
+        self.assertLess(text.index('Final audit: 2 saved selections to check'),text.index('Checking saved selection 1/2'))
 
     def test_deeper_probe_plan_and_confirmation_progress_are_visible(self):
         run=self.create(); run.console=FakeConsole(self.exports,shafts={(0,0)})
@@ -478,6 +480,73 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.collect(run),0)
         self.assertNotEqual(record['selected']['file'],old)
 
+    def test_partial_audit_counts_only_saved_selections_and_separates_missing_captures(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        with patch('sys.stdout',new=io.StringIO()):
+            self.assertTrue(run.capture_section(run.state['units'][0]))
+        run.console.command=lambda *args,**kwargs:self.fail('Auditing sent a server command')
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            report=run.audit()
+        text=output.getvalue()
+        self.assertIn('Final audit: 1 saved selection to check; 1 uncaptured selection. No server commands will be sent.',text)
+        self.assertIn('Checking saved selection 1/1 (plan 1/2): primary + 0 probes ...',text)
+        self.assertNotIn('Checking saved selection 2/',text)
+        self.assertNotIn('Auditing run selection',text)
+        self.assertIn('1 awaits validated neighboring captures',text)
+        self.assertIn('uncaptured selections=1; validation failures=0.',text)
+        self.assertEqual([item['unit'] for item in report['uncaptured_selections']],['s00002'])
+        self.assertEqual(report['file_errors'],[])
+        self.assertFalse(report['finished'])
+        self.assertFalse(run.state['files_verified'])
+        phases=('Checking saved selection 1/1','Comparing neighboring exports',
+                'Computing requested coverage and gaps','Writing audit report, preview, and checkpoint')
+        self.assertEqual(sorted(phases,key=text.index),list(phases))
+        self.assertRegex(text,r'Checking saved selection 1/1[^\n]+validated \(\d+\.\d+s\)\.')
+        self.assertIsNone(run._audit_progress)
+
+    def test_audit_distinguishes_a_failed_selected_file_from_an_uncaptured_selection(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        with patch('sys.stdout',new=io.StringIO()):
+            self.assertTrue(run.capture_section(run.state['units'][0]))
+        record=run.state['sections']['s00001']
+        (self.exports/record['selected']['file']).unlink()
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            report=run.audit()
+        self.assertEqual([item['unit'] for item in report['file_errors']],['s00001'])
+        self.assertEqual([item['unit'] for item in report['uncaptured_selections']],['s00002'])
+        self.assertIn('... FAILED:',output.getvalue())
+        self.assertIn('uncaptured selections=1; validation failures=1.',output.getvalue())
+        self.assertFalse(report['finished'])
+
+    def test_slow_audit_reports_its_current_phase_before_the_file_check_returns(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        heartbeat=threading.Event()
+        class AuditStream(io.StringIO):
+            def flush(self):
+                if 'checking block records and extents of primary export (' in self.getvalue():
+                    heartbeat.set()
+        output=AuditStream(); inspect=p.inspect_export; checked=[]; workers=[]
+        def slow_inspect(*args,**kwargs):
+            if not checked:
+                checked.append(True)
+                self.assertTrue(heartbeat.wait(1),'The long file check did not report its current phase')
+                self.assertNotIn('... validated (',output.getvalue())
+            return inspect(*args,**kwargs)
+        progress_class=runmod.AuditProgress
+        def progress():
+            worker=progress_class(interval=0.01)
+            workers.append(worker)
+            return worker
+        with patch('sys.stdout',new=output), patch.object(p,'inspect_export',side_effect=slow_inspect), \
+                patch.object(runmod,'AuditProgress',side_effect=progress):
+            report=run.audit()
+        self.assertTrue(report['finished'])
+        self.assertTrue(checked)
+        self.assertIn('elapsed',output.getvalue())
+        self.assertTrue(all(not worker._thread.is_alive() for worker in workers))
+
     def test_game_version_change_requires_review_instead_of_reusing_or_deleting(self):
         run=self.create(); run.console=FakeConsole(self.exports)
         with patch('sys.stdout',new=io.StringIO()):
@@ -640,6 +709,216 @@ class RunTests(unittest.TestCase):
         args=['coordinator','--resume',str(run.directory),'--report-coverage']
         with patch('sys.argv',args), patch('subprocess.run',side_effect=AssertionError('No commands')), patch('sys.stdout',new=io.StringIO()):
             self.assertEqual(coordinator.main(),0)
+        self.assertTrue(p.read_json(run.path)['finished'])
+
+    def test_quitting_an_interrupted_report_prints_an_audit_only_rerun_command(self):
+        run=self.create('run with spaces'); self.assertEqual(self.collect(run),0)
+        report_path=run.directory/(run.state['run_id']+'-audit.json')
+        previous_report=report_path.read_bytes()
+        args=['coordinator','--resume',str(run.directory),'--report-coverage']
+        for answer in ('q',EOFError()):
+            with self.subTest(answer=answer):
+                output=io.StringIO(); prompts=[]
+                def quit_audit(prompt):
+                    prompts.append(prompt)
+                    self.assertIn('Coverage audit paused',coordinator.ACTIVE_STATUS.status_text())
+                    if isinstance(answer,Exception):
+                        raise answer
+                    return answer
+                with patch('sys.argv',args), patch('sys.stdout',new=output), \
+                        patch.object(runmod.Run,'read_ref',side_effect=KeyboardInterrupt), \
+                        patch('builtins.input',side_effect=quit_audit), \
+                        patch('subprocess.run',side_effect=AssertionError('No server commands')):
+                    self.assertEqual(coordinator.main(),130)
+                self.assertEqual(prompts,['[c]ontinue audit, [r]estart from beginning, [q]uit audit: '])
+                text=output.getvalue()
+                self.assertIn('Coverage audit paused; checkpoint saved.',text)
+                self.assertIn('Coverage audit stopped; checkpoint saved.',text)
+                self.assertNotIn('Restart with the same plan to continue',text)
+                self.assertNotIn('raw selections;',text)
+                self.assertNotIn('Export prefix:',text)
+                command=shlex.split(text.split('Rerun the audit with:\n',1)[1].strip())
+                self.assertEqual(command[-3:],['--resume',str(run.directory.resolve()),'--report-coverage'])
+                self.assertFalse(p.read_json(run.path)['finished'])
+                self.assertEqual(p.read_json(run.path)['audit_status'],'interrupted')
+                self.assertEqual(report_path.read_bytes(),previous_report)
+
+    def test_restart_at_the_audit_interrupt_prompt_rechecks_from_the_beginning(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        first=run.state['sections']['s00001']['selected']['file']
+        second=run.state['sections']['s00002']['selected']['file']
+        read=runmod.Run.read_ref; calls=[]; prompts=[]
+        def interrupted_read(active,ref):
+            calls.append(ref['file'])
+            if len(calls)==2:
+                raise KeyboardInterrupt
+            if len(calls)==3:
+                snapshot=coordinator.ACTIVE_STATUS.audit_source.audit_snapshot
+                self.assertEqual(snapshot['checked'],0)
+                self.assertEqual(snapshot['validated'],0)
+                self.assertEqual(snapshot['failed'],0)
+            return read(active,ref)
+        def restart(prompt):
+            prompts.append(prompt)
+            self.assertIn('1/2 saved selections checked',coordinator.ACTIVE_STATUS.status_text())
+            return 'r'
+        args=['coordinator','--resume',str(run.directory),'--report-coverage']
+        with patch('sys.argv',args), patch('sys.stdout',new=io.StringIO()), \
+                patch.object(runmod.Run,'read_ref',autospec=True,side_effect=interrupted_read), \
+                patch('builtins.input',side_effect=restart), \
+                patch('subprocess.run',side_effect=AssertionError('No server commands')):
+            self.assertEqual(coordinator.main(),0)
+        self.assertEqual(prompts,['[c]ontinue audit, [r]estart from beginning, [q]uit audit: '])
+        self.assertEqual(calls,[first,second,first,second])
+        self.assertTrue(p.read_json(run.path)['finished'])
+
+    def test_continue_at_the_audit_prompt_retains_checked_selections_across_pauses(self):
+        for interruptions in (1,2):
+            with self.subTest(interruptions=interruptions):
+                run=self.create(f'continue-{interruptions}'); self.assertEqual(self.collect(run),0)
+                first=run.state['sections']['s00001']['selected']['file']
+                second=run.state['sections']['s00002']['selected']['file']
+                read=runmod.Run.read_ref; calls=[]; pauses=[]
+                def interrupted_read(active,ref):
+                    calls.append(ref['file'])
+                    if ref['file']==second and calls.count(second)<=interruptions:
+                        raise KeyboardInterrupt
+                    if len(calls)>2:
+                        self.assertEqual(active.audit_snapshot['checked'],1)
+                    return read(active,ref)
+                def proceed(prompt):
+                    self.assertEqual(prompt,'[c]ontinue audit, [r]estart from beginning, [q]uit audit: ')
+                    snapshot=coordinator.ACTIVE_STATUS.audit_source.audit_snapshot
+                    pauses.append(snapshot.copy())
+                    self.assertEqual(snapshot['checked'],1)
+                    return 'c'
+                args=['coordinator','--resume',str(run.directory),'--report-coverage']
+                with patch('sys.argv',args), patch('sys.stdout',new=io.StringIO()), \
+                        patch.object(runmod.Run,'read_ref',autospec=True,side_effect=interrupted_read), \
+                        patch('builtins.input',side_effect=proceed), \
+                        patch('subprocess.run',side_effect=AssertionError('No server commands')):
+                    self.assertEqual(coordinator.main(),0)
+                self.assertEqual(calls,[first]+[second]*(interruptions+1))
+                self.assertEqual(len(pauses),interruptions)
+                self.assertTrue(all(pause['started']==pauses[0]['started'] for pause in pauses))
+                self.assertTrue(p.read_json(run.path)['finished'])
+
+    def test_continue_retries_only_the_unfinished_coverage_calculation(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        phase=['']; counts={'required':0,'full':0}; difference=p.difference
+        run.activity=lambda description,unit=None:phase.__setitem__(0,description)
+        def interrupt_full_height(*args,**kwargs):
+            if phase[0]=='Computing gaps in required-height coverage':
+                counts['required']+=1
+            if phase[0]=='Computing gaps across the full requested height':
+                counts['full']+=1
+                if counts['full']==1:
+                    raise KeyboardInterrupt
+            return difference(*args,**kwargs)
+        with patch.object(p,'difference',side_effect=interrupt_full_height), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+            self.assertEqual(run.audit_snapshot['checked'],2)
+            with patch.object(run,'read_ref',side_effect=AssertionError('Already checked export was re-read')), \
+                    patch.object(run,'seams',side_effect=AssertionError('Completed overlap checks were repeated')):
+                report=run.audit(continue_previous=True)
+        self.assertEqual(counts,{'required':1,'full':2})
+        self.assertTrue(report['finished'])
+        self.assertEqual(len(report['files']),2)
+
+    def test_continue_rechecks_the_interrupted_selections_primary_and_probes(self):
+        run=self.create(); self.assertEqual(self.collect(run,FakeConsole(self.exports,shafts={(2,0)})),0)
+        read=run.read_ref; calls=[]; interrupted=[False]
+        def interrupt_probe(ref):
+            calls.append((ref['unit'],ref['purpose']))
+            if ref['unit']=='s00002' and ref['purpose']=='depth' and not interrupted[0]:
+                interrupted[0]=True
+                raise KeyboardInterrupt
+            return read(ref)
+        with patch.object(run,'read_ref',side_effect=interrupt_probe), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+            report=run.audit(continue_previous=True)
+        self.assertEqual(calls,[('s00001','section'),('s00001','depth'),
+                                ('s00002','section'),('s00002','depth'),
+                                ('s00002','section'),('s00002','depth')])
+        self.assertTrue(report['finished'])
+        self.assertEqual(len(report['files']),4)
+        self.assertEqual(len({ref['file'] for ref in report['files']}),4)
+
+    def test_changed_deeper_probe_invalidates_its_whole_selections_cached_result(self):
+        run=self.create(); self.assertEqual(self.collect(run,FakeConsole(self.exports,shafts={(0,0)})),0)
+        with patch.object(run,'seams',side_effect=KeyboardInterrupt), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+        (self.exports/run.state['sections']['s00001']['probes'][0]['file']).unlink()
+        with patch.object(run,'read_ref',wraps=run.read_ref) as read, patch('sys.stdout',new=io.StringIO()):
+            report=run.audit(continue_previous=True)
+        self.assertEqual([(call.args[0]['unit'],call.args[0]['purpose']) for call in read.call_args_list],
+                         [('s00001','section'),('s00001','depth')])
+        self.assertFalse(report['finished'])
+        self.assertEqual([error['unit'] for error in report['file_errors']],['s00001'])
+        self.assertEqual(len(report['files']),1)
+
+    def test_continuation_invalidates_completed_checks_and_gaps_when_an_export_changed(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        phase=['']; interrupted=[False]; difference=p.difference
+        run.activity=lambda description,unit=None:phase.__setitem__(0,description)
+        def interrupt_full_height(*args,**kwargs):
+            if phase[0]=='Computing gaps across the full requested height' and not interrupted[0]:
+                interrupted[0]=True
+                raise KeyboardInterrupt
+            return difference(*args,**kwargs)
+        with patch.object(p,'difference',side_effect=interrupt_full_height), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+        self.assertEqual(run._audit_session['gaps'],[])
+        self.assertTrue(all(pair['status']=='match' for pair in run._audit_session['checks']))
+        first=run.state['sections']['s00001']['selected']['file']
+        path=self.exports/first; path.write_bytes(path.read_bytes()+b'\n')
+        with patch.object(run,'read_ref',wraps=run.read_ref) as read, patch('sys.stdout',new=io.StringIO()):
+            report=run.audit(continue_previous=True)
+        self.assertEqual([call.args[0]['file'] for call in read.call_args_list],[first])
+        self.assertFalse(report['finished'])
+        self.assertTrue(report['gaps'])
+        self.assertEqual([error['unit'] for error in report['file_errors']],['s00001'])
+        self.assertTrue(all(pair['status']=='pending' for pair in report['overlap_checks']))
+        self.assertEqual(len(report['files']),1)
+
+    def test_continue_after_selection_commit_does_not_duplicate_its_evidence(self):
+        run=self.create(); self.assertEqual(self.collect(run,FakeConsole(self.exports,shafts={(0,0)})),0)
+        apply_result=run._apply_audit_result; interrupted=[False]
+        def interrupt_after_commit(unit,result):
+            apply_result(unit,result)
+            if unit['id']=='s00002' and not interrupted[0]:
+                interrupted[0]=True
+                raise KeyboardInterrupt
+        with patch.object(run,'_apply_audit_result',side_effect=interrupt_after_commit), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+        with patch.object(run,'read_ref',side_effect=AssertionError('Committed selection was re-read')), patch('sys.stdout',new=io.StringIO()):
+            report=run.audit(continue_previous=True)
+        self.assertTrue(report['finished'])
+        self.assertEqual(len(report['files']),3)
+        self.assertEqual(len({ref['file'] for ref in report['files']}),3)
+
+    def test_continue_after_report_write_interruption_preserves_all_completed_computation(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        write=runmod.atomic_json; interrupted=[False]
+        def interrupt_report(path,value):
+            if path.name.endswith('-audit.json') and not interrupted[0]:
+                interrupted[0]=True
+                raise KeyboardInterrupt
+            return write(path,value)
+        with patch.object(runmod,'atomic_json',side_effect=interrupt_report), patch('sys.stdout',new=io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                run.audit()
+        with patch.object(run,'read_ref',side_effect=AssertionError('Completed file checks repeated')), \
+                patch.object(p,'difference',side_effect=AssertionError('Completed coverage calculation repeated')), \
+                patch.object(run,'seams',side_effect=AssertionError('Completed overlap checks repeated')), \
+                patch('sys.stdout',new=io.StringIO()):
+            report=run.audit(continue_previous=True)
+        self.assertTrue(report['finished'])
         self.assertTrue(p.read_json(run.path)['finished'])
 
 

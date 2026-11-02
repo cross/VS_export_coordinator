@@ -5,6 +5,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,53 @@ class StatusTests(unittest.TestCase):
         text=reporter.status_text()
         self.assertIn('Run finished: False; required coverage: True; overlaps: False; audit: not_run.',text)
         self.assertNotIn('accepted',text)
+
+    def test_audit_snapshot_reports_audit_work_instead_of_collection_counts(self):
+        reporter=self.reporter()
+        snapshot={'started':reporter.started,'total':44,'checked':31,'validated':30,
+                  'failed':1,'stage':'checking saved selections'}
+        source=SimpleNamespace(audit_snapshot=snapshot,auditing=True)
+        reporter.configure(reporter.cuboids,reporter.state,operation='audit',audit_source=source)
+        reporter.state['audit_status']='running'
+        reporter.set_activity('Comparing deeper probe 2/4 with the primary export',reporter.cuboids[3])
+        before=deepcopy(reporter.state)
+        text=reporter.status_text()
+        for expected in ('Coverage audit status','31/44 saved selections checked',
+                         '30 validated, 1 failed, 13 remaining','Audit elapsed',
+                         'stage: checking saved selections','Comparing deeper probe 2/4','section 4'):
+            self.assertIn(expected,text)
+        for irrelevant in ('selections captured','waiting,','pending.','Run finished:',
+                           'required coverage:','Saved deeper confirmations:'):
+            self.assertNotIn(irrelevant,text)
+        self.assertEqual(reporter.state,before)
+        self.assertEqual(source.audit_snapshot,snapshot)
+        with patch.object(os,'write') as write, patch('builtins.print',side_effect=AssertionError('Must use unbuffered output')):
+            reporter.on_status_signal(None,None)
+        self.assertIn(b'31/44 saved selections checked',write.call_args.args[1])
+
+    def test_collection_uses_audit_status_only_while_its_final_audit_is_active(self):
+        reporter=self.reporter()
+        source=SimpleNamespace(auditing=True,audit_snapshot={
+            'started':reporter.started,'total':2,'checked':2,'validated':2,
+            'failed':0,'stage':'computing requested coverage and gaps'})
+        reporter.configure(reporter.cuboids,reporter.state,audit_source=source)
+        self.assertIn('2/2 saved selections checked',reporter.status_text())
+        source.auditing=False
+        self.assertIn('2/5 selections captured',reporter.status_text())
+
+    def test_audit_status_before_start_and_while_paused_are_explicit(self):
+        reporter=self.reporter()
+        source=SimpleNamespace(auditing=False,audit_snapshot=None)
+        reporter.configure(reporter.cuboids,reporter.state,operation='audit',audit_source=source)
+        self.assertIn('preparing audit',reporter.status_text())
+        self.assertNotIn('selections captured',reporter.status_text())
+        source.audit_snapshot={'started':reporter.started,'total':44,'checked':31,
+                               'validated':31,'failed':0,'stage':'checking saved selections'}
+        reporter.state['audit_status']='interrupted'
+        reporter.set_activity('Coverage audit paused; choose continue, restart from the beginning, or quit')
+        text=reporter.status_text()
+        self.assertIn('Audit: interrupted',text)
+        self.assertIn('Coverage audit paused',text)
 
     def test_actual_status_signals_use_unbuffered_output_without_mutating_state(self):
         reporter=self.reporter()

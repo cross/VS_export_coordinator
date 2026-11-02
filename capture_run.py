@@ -21,6 +21,7 @@ import subprocess
 import time
 import uuid
 
+from capture_progress import AuditProgress
 import v12_capture_plan as p
 
 SCHEMA = 'coast-capture-run/3'
@@ -324,6 +325,10 @@ class Run:
         self.verbose=False
         self.recovery_handler=None
         self._announcement_open=False
+        self._audit_progress=None
+        self.audit_snapshot=None
+        self.auditing=False
+        self._audit_session=None
         self.activity=activity or (lambda description,unit=None:None)
         self.units={unit['id']:unit for unit in state['units']}
         self.pairs=overlap_pairs(state['units'])
@@ -348,6 +353,20 @@ class Run:
         prefix='' if self._announcement_open else '  Primary export: '
         self._announcement_open=False
         print(prefix+description,flush=True)
+
+    def phase(self,description,unit=None,*,detail=None):
+        self.activity(description,unit)
+        if self._audit_progress is not None:
+            self._audit_progress.update(detail or description)
+
+    def ref_label(self,ref):
+        if ref.get('purpose')=='section':
+            return 'primary export'
+        probes=self.state['sections'].get(ref.get('unit'),{}).get('probes',[])
+        for index,probe in enumerate(probes,1):
+            if probe.get('file')==ref.get('file'):
+                return f'deeper probe {index}/{len(probes)}'
+        return 'deeper probe'
 
     def section_attempt_limit(self,record):
         return max(self.state['attempt_limit'],record.get('manual_retry_limit',0))
@@ -540,7 +559,8 @@ class Run:
         issued=self.state['sections'].get(ref['unit'],{}).get('issued_exports',[])
         if not any(item==ref for item in issued):
             raise CaptureError('Export was not issued by this run: '+name)
-        self.activity('Validating export: '+name,self.units[ref['unit']])
+        unit=self.units[ref['unit']]; label=self.ref_label(ref)
+        self.phase('Reading export: '+name,unit,detail='reading '+label)
         path=self.export_dir/name
         info=path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
@@ -548,6 +568,7 @@ class Run:
                 or info.st_size!=ref['size'] or info.st_mtime_ns!=ref['mtime_ns'] or info.st_ctime_ns!=ref['ctime_ns']):
             raise CaptureError('Export changed or has stale timestamps: '+name)
         payload=path.read_bytes()
+        self.phase('Hashing export: '+name,unit,detail='hashing '+label)
         if hashlib.sha256(payload).hexdigest()!=ref['sha256']:
             raise CaptureError('Export hash changed: '+name)
         after=path.lstat()
@@ -558,6 +579,9 @@ class Run:
     def read_ref(self,ref):
         payload,info=self.verified_ref_bytes(ref)
         name=ref['file']; path=self.export_dir/name
+        unit=self.units[ref['unit']]; label=self.ref_label(ref)
+        self.phase('Checking sparse block records and extents: '+name,unit,
+                   detail='checking block records and extents of '+label)
         evidence=p.inspect_export(path,ref['requested'],self.plan['world_center'])
         after=path.lstat()
         if ((evidence.get('sha256') is not None and evidence['sha256']!=ref['sha256'])
@@ -565,6 +589,7 @@ class Run:
             raise CaptureError('Export changed while being validated: '+name)
         if evidence['problems'] and evidence['problems']!=['Empty sparse export cannot establish coverage']:
             raise CaptureError(name+': '+'; '.join(evidence['problems']))
+        self.phase('Parsing export: '+name,unit,detail='parsing '+label)
         data=json.loads(payload)
         version=data.get('GameVersion')
         if not isinstance(version,str) or not version:
@@ -592,6 +617,7 @@ class Run:
                 or bounds['xmax']-bounds['xmin']!=31 or bounds['zmax']-bounds['zmin']!=31):
             raise CaptureError('Deeper probe does not establish loaded column presence')
         affected={(x,z) for x,z in pending if bounds['xmin']<=x<=bounds['xmax'] and bounds['zmin']<=z<=bounds['zmax']}
+        self.phase(f'Comparing {self.ref_label(probe)} with the primary export',unit)
         left=canonical_map(data,unit['capture'],unit['capture'],affected)
         right=canonical_map(fresh,bounds,unit['capture'],affected)
         if left!=right:
@@ -602,6 +628,7 @@ class Run:
         if selected['requested']!=unit['capture'] or selected['purpose']!='section' or selected['unit']!=unit['id']:
             raise CaptureError('Selected export does not match the run selection')
         data,evidence=self.read_ref(selected)
+        self.phase(f'Checking column evidence through Y={self.anchor(unit)}',unit)
         missing=columns_needing_confirmation(data,unit['capture'],self.anchor(unit))
         pending=set(missing)
         for probe in probes:
@@ -747,50 +774,175 @@ class Run:
         return {**pair,'difference':mismatches(canonical_map(a,left['requested'],pair['bounds']),
                                                canonical_map(b,right['requested'],pair['bounds']))}
 
-    def audit(self):
-        selected=sum(bool(self.state['sections'].get(name,{}).get('selected')) for name in self.units)
-        if selected:
-            self.announce(f'Final audit: rechecking {selected} selected exports and their probes, '
-                          f'then verifying {len(self.pairs)} overlaps and exact requested coverage.')
+    def audit(self,*,continue_previous=False):
+        self.end_announcement()
+        self.auditing=True
+        try:
+            with AuditProgress() as progress:
+                self._audit_progress=progress
+                return self._audit(progress,continue_previous)
+        finally:
+            self._audit_progress=None
+            self.auditing=False
+
+    def audit_update(self,**changes):
+        # Publish one immutable snapshot for the signal handler; it must never
+        # acquire the progress worker's lock or observe half-updated counters.
+        self.audit_snapshot={**(self.audit_snapshot or {}),**changes}
+
+    def _audit_selection(self,unit):
+        """Compute one result without partially crediting an interrupted check."""
+        record=self.state['sections'][unit['id']]
+        refs=[record['selected'],*record.get('probes',[])]
+        try:
+            data,evidence,coverage=self.check_section(unit,record['selected'],record.get('probes',[]))
+            self.phase('Rebuilding neighboring overlap comparisons',unit)
+            strips=section_fingerprints(data,unit['capture'],self.incident[unit['id']])
+            formal=[]
+            if evidence['covered']:
+                intersection=p.intersection(evidence['covered'],unit['core'])
+                if intersection:
+                    self.phase('Computing reported extent coverage for this selection',unit)
+                    formal=p.difference([intersection],evidence['column_presence']['missing_regions'])
+            warning=(f"{unit['id']}: {coverage['ceiling_records']} records reach requested Y ceiling {unit['capture']['ymax']}"
+                     if coverage['ceiling_records'] else None)
+            return {'refs':refs,'error':None,'coverage':coverage,'fingerprints':strips,
+                    'formal':formal,'warning':warning,'core':unit['core']}
+        except (CaptureError,OSError,ValueError,KeyError) as exc:
+            return {'refs':refs,'error':{'unit':unit['id'],'problem':str(exc),
+                                       'selected':record['selected'],'candidate':record.get('candidate')}}
+
+    def _apply_audit_result(self,unit,result):
+        record=self.state['sections'][unit['id']]
+        if result['error'] is not None:
+            record.update(status='incomplete',error=result['error']['problem'],fingerprints={})
         else:
-            self.announce(f'Final audit: no validated primary exports are selected; '
-                          f'checking missing coverage for {len(self.units)} selections.')
+            record.update(status='complete',coverage=result['coverage'],fingerprints=result['fingerprints'])
+            record.pop('error',None)
+
+    def _audit_counts(self,work):
+        results=[work['results'][name] for name in self.units if name in work['results']]
+        failed=sum(result['error'] is not None for result in results)
+        self.audit_update(checked=len(results),validated=len(results)-failed,failed=failed)
+
+    def _audit_refs_unchanged(self,refs):
+        for ref in refs:
+            try:
+                path=self.export_dir/ref['file']; info=path.lstat()
+                if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
+                        or (info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+                        !=(ref['size'],ref['mtime_ns'],ref['ctime_ns'])):
+                    return False
+            except (OSError,KeyError):
+                return False
+        return True
+
+    def _audit(self,progress,continue_previous=False):
+        selected=sum(bool(self.state['sections'].get(name,{}).get('selected')) for name in self.units)
+        uncaptured=[{'unit':unit['id'],'index':unit['index'],
+                     'candidate':self.state['sections'].get(unit['id'],{}).get('candidate')}
+                    for unit in self.state['units']
+                    if not self.state['sections'].get(unit['id'],{}).get('selected')]
+        signature=p.digest({'definition_hash':self.state['definition_hash'],
+                            'selections':[(name,self.state['sections'].get(name,{}).get('selected'),
+                                           self.state['sections'].get(name,{}).get('probes',[]))
+                                          for name in self.units]})
+        continuing=bool(continue_previous and self._audit_session is not None
+                        and self._audit_session['signature']==signature)
+        if not continuing:
+            self._audit_session={'signature':signature,'started':time.monotonic(),
+                                 'results':{},'checks':None,'gaps':None,'formal_gaps':None}
+        work=self._audit_session
+        self.audit_snapshot={'started':work['started'],'total':selected,'checked':0,
+                             'validated':0,'failed':0,'stage':'checking saved selections'}
+        self._audit_counts(work)
+        if continuing:
+            self.announce('Continuing coverage audit; completed checks are retained, unfinished work will be retried.')
+        else:
+            if continue_previous and work['results']=={}:
+                self.announce('No compatible audit work to retain; starting the audit from the beginning.')
+            self.announce(f"Final audit: {count_label(selected,'saved selection')} to check; "
+                          f"{count_label(len(uncaptured),'uncaptured selection')}. No server commands will be sent.")
         self.state.update(audit_status='running',coverage_complete=None,overlap_complete=None,files_verified=None,finished=False)
         self.save()
-        covered,formal,files,errors,warnings=[],[],[],[],[]
-        for index,unit in enumerate(self.state['units'],1):
-            self.activity(f'Auditing selection {index}/{len(self.units)}',unit)
-            if self.verbose or index==1 or index%10==0 or index==len(self.units):
-                print(f"Auditing run selection {index}/{len(self.units)}: {unit['id']}",flush=True)
+        if continuing and work['results']:
+            self.audit_update(stage='checking previously audited files for changes')
+            self.phase('Checking previously audited files for changes')
+            progress.begin('Checking previously audited files for changes')
+            invalid=[name for name,result in work['results'].items() if not self._audit_refs_unchanged(result['refs'])]
+            if invalid:
+                # Invalidate dependent phases before dropping results, so even
+                # an interrupt during this small commit cannot retain old gaps.
+                work.update(checks=None,gaps=None,formal_gaps=None)
+                for name in invalid:
+                    work['results'].pop(name,None)
+                self._audit_counts(work)
+            progress.finish(f'{len(invalid)} selections need rechecking' if invalid else 'unchanged')
+        checked=0
+        for unit in self.state['units']:
             record=self.state['sections'].get(unit['id'],{})
-            try:
-                if not record.get('selected'):
-                    raise CaptureError('No validated whole-section export selected')
-                data,evidence,coverage=self.check_section(unit,record['selected'],record.get('probes',[]))
-                record['fingerprints']=section_fingerprints(data,unit['capture'],self.incident[unit['id']])
-                record.update(status='complete',coverage=coverage)
-                record.pop('error',None)
-                if coverage['ceiling_records']:
-                    warnings.append(f"{unit['id']}: {coverage['ceiling_records']} records reach requested Y ceiling {unit['capture']['ymax']}")
-                covered.append(unit['core'])
-                if evidence['covered']:
-                    intersection=p.intersection(evidence['covered'],unit['core'])
-                    if intersection:
-                        formal.extend(p.difference([intersection],evidence['column_presence']['missing_regions']))
-                files.extend([record['selected'],*record.get('probes',[])])
-            except (CaptureError,OSError,ValueError,KeyError) as exc:
-                errors.append({'unit':unit['id'],'problem':str(exc),'selected':record.get('selected'),
-                               'candidate':record.get('candidate')})
-                record.update(status='incomplete',error=str(exc),fingerprints={})
-        self.announce(f'Final audit: comparing {len(self.pairs)} overlap strips and computing exact coverage gaps.')
-        checks=self.seams()
-        checks=[self.seam_detail(check) if check['status']=='mismatch' else check for check in checks]
+            if not record.get('selected'):
+                record.update(status='incomplete',error='No validated whole-section export selected',fingerprints={})
+                continue
+            checked+=1
+            if unit['id'] in work['results']:
+                self._apply_audit_result(unit,work['results'][unit['id']])
+                continue
+            self.audit_update(stage='checking saved selections')
+            label=f"Checking saved selection {checked}/{selected} (plan {unit['index']}/{len(self.units)})"
+            detail=f"primary + {count_label(len(record.get('probes',[])),'probe')}"
+            self.activity(label+': '+detail,unit)
+            progress.begin(label,detail)
+            # A single assignment commits the entire completed selection. A
+            # SIGINT during validation leaves nothing partly credited to resume.
+            result=self._audit_selection(unit)
+            work['results'][unit['id']]=result
+            self._apply_audit_result(unit,result)
+            self._audit_counts(work)
+            progress.finish('validated' if result['error'] is None else 'FAILED: '+result['error']['problem'])
+        results=[work['results'][name] for name in self.units if name in work['results']]
+        errors=[result['error'] for result in results if result['error'] is not None]
+        valid=[result for result in results if result['error'] is None]
+        covered=[result['core'] for result in valid]
+        formal=[bounds for result in valid for bounds in result['formal']]
+        files=[ref for result in valid for ref in result['refs']]
+        warnings=[result['warning'] for result in valid if result['warning']]
+        if work['checks'] is None:
+            self.audit_update(stage='comparing neighboring exports')
+            self.phase('Comparing neighboring exports')
+            progress.begin('Comparing neighboring exports',count_label(len(self.pairs),'overlap check'))
+            checks=self.seams()
+            for index,check in enumerate(checks):
+                if check['status']=='mismatch':
+                    self.phase('Investigating overlap mismatch '+check['id'])
+                    checks[index]=self.seam_detail(check)
+            work['checks']=checks
+            matches=sum(check['status']=='match' for check in checks)
+            pending=sum(check['status']=='pending' for check in checks)
+            mismatches=sum(check['status']=='mismatch' for check in checks)
+            overlap_result=f"{count_label(matches,'overlap check')} {'agrees' if matches==1 else 'agree'}"
+            if pending:
+                overlap_result+=f"; {pending} {'awaits' if pending==1 else 'await'} validated neighboring captures"
+            if mismatches:
+                overlap_result+=f"; {mismatches} {'differs' if mismatches==1 else 'differ'}"
+            progress.finish(overlap_result)
+        checks=work['checks']
         required=[{**bounds,'ymax':max(bounds['ymin'],min(bounds['ymax'],self.state['settings']['coverage_y']))} for bounds in self.plan['requests']]
-        gaps=p.difference(required,covered)
-        formal_gaps=p.difference(self.plan['requests'],formal)
+        if work['gaps'] is None or work['formal_gaps'] is None:
+            self.audit_update(stage='computing requested coverage and gaps')
+            self.phase('Computing requested coverage and gaps')
+            progress.begin('Computing requested coverage and gaps')
+            if work['gaps'] is None:
+                self.phase('Computing gaps in required-height coverage')
+                work['gaps']=p.difference(required,covered)
+            if work['formal_gaps'] is None:
+                self.phase('Computing gaps across the full requested height')
+                work['formal_gaps']=p.difference(self.plan['requests'],formal)
+            progress.finish('required coverage complete' if not work['gaps'] else f"{len(work['gaps'])} uncovered required-height regions")
+        gaps,formal_gaps=work['gaps'],work['formal_gaps']
         overlaps_ok=all(check['status']=='match' for check in checks)
         self.state.update(coverage_complete=not gaps,column_coverage_complete=not gaps,overlap_complete=overlaps_ok,
-                          files_verified=not errors)
+                          files_verified=not errors and not uncaptured)
         report={'schema':SCHEMA,'run_id':self.state['run_id'],'plan_hash':self.plan['plan_hash'],
                 'operational_model':OPERATIONAL_MODEL,'definition_hash':self.state['definition_hash'],
                 'observed_game_version':self.state.get('observed_game_version'),
@@ -799,21 +951,29 @@ class Run:
                 'coverage_complete':not gaps,'column_coverage_complete':not gaps,'gaps':gaps,
                 'full_3d_coverage_complete':not formal_gaps,'full_3d_gaps':formal_gaps,
                 'overlap_complete':overlaps_ok,'overlap_checks':checks,'file_errors':errors,'files':files,
+                'uncaptured_selections':uncaptured,
                 'warnings':warnings,
                 'evidence_limits':'Loaded-export evidence and matching sparse block-code multisets; not an atomic world snapshot. Omitted upper air stays formally unverified.'}
         self.state['full_3d_coverage_complete']=not formal_gaps
-        report['finished']=bool(not gaps and overlaps_ok and not errors and all(
+        report['finished']=bool(not gaps and overlaps_ok and not errors and not uncaptured and all(
             self.state['sections'].get(name,{}).get('status')=='complete' for name in self.units))
-        self.announce('Writing the audit report, preview, and final checkpoint.')
+        self.audit_update(stage='writing report, preview, and checkpoint')
+        self.phase('Writing audit report, preview, and checkpoint')
+        progress.begin('Writing audit report, preview, and checkpoint')
+        self.phase('Rendering preview')
         self.preview()
+        self.phase('Writing audit JSON')
         atomic_json(self.directory/(self.state['run_id']+'-audit.json'),report)
         self.state['audit_status']='complete'
         if report['finished']:
             self.state.pop('last_error',None)
+        self.phase('Writing final checkpoint')
         self.save()
+        self.audit_update(stage='complete')
+        progress.finish('done')
         print(f"Run {self.state['run_id']}: finished={self.state['finished']}; "
               f"required coverage={not gaps}; overlaps={sum(c['status']=='match' for c in checks)}/{len(checks)}; "
-              f"file errors={len(errors)}.",flush=True)
+              f"uncaptured selections={len(uncaptured)}; validation failures={len(errors)}.",flush=True)
         for warning in warnings:
             print('Height warning: '+warning,flush=True)
         return report
@@ -903,7 +1063,7 @@ class Run:
             report=self.audit()
             if report['finished']:
                 return 0
-            affected={error['unit'] for error in report['file_errors']}
+            affected={error['unit'] for error in report['file_errors']+report['uncaptured_selections']}
             for pair in report['overlap_checks']:
                 if pair['status']=='mismatch':
                     affected.add(pair['left'])

@@ -421,8 +421,65 @@ to avoid bytecode-cache writes beside installed Python modules.
 
 Reports write `RUN_ID-audit.json` inside the run directory. The report contains
 all core/capture bounds, selected primary/probe filenames and hashes, exact
-required-height and full-height gaps, overlap checks, file errors, and ceiling
-warnings. The progress checkpoint retains pending candidates and superseded
+required-height and full-height gaps, overlap checks, file errors, uncaptured
+selections, and ceiling warnings. `uncaptured_selections` identifies plan units
+with no selected primary export; `file_errors` identifies selected captures that
+failed validation. Uncaptured selections still leave coverage and the run
+incomplete, but are not counted as corrupt or invalid selected files.
+
+Audits announce how many saved selections they will check and how many plan
+selections have no completed capture. Auditing sends no server commands. Each
+saved selection reports its position among the saved captures, its original
+plan number, the primary/probe count, validation result, and elapsed time:
+
+```text
+Final audit: 44 saved selections to check; 116 uncaptured selections. No server commands will be sent.
+  Checking saved selection 1/44 (plan 1/160): primary + 4 probes ... validated (12.4s).
+```
+
+In a terminal, the checking line stays open and updates in place approximately
+every five seconds while work continues. It shows the current phase and elapsed
+time, including reading/hashing files, checking sparse block records and
+extents, checking column evidence, comparing numbered deeper probes, or
+rebuilding overlap comparisons. A completed step replaces that temporary
+progress with its result. Redirected output uses ordinary lines and periodic
+updates, without carriage returns or terminal escape sequences. Phase changes
+do not each print a new line.
+
+Neighbor overlap comparisons, requested coverage/gap calculations, and writing
+the report, preview, and checkpoint each get a separate timed progress step.
+The overlap result distinguishes agreement, mismatches, and checks awaiting
+validated neighboring captures. The final summary separates uncaptured
+selections from validation failures. This progress is available in normal and
+verbose output, both for `--report-coverage` (`--report`) and the audit after
+collection. Ctrl-T/SIGUSR1 status remains available. No estimated percentage is
+invented for a file or phase whose remaining work is unknown.
+
+In `--report-coverage` mode, Ctrl-C saves an interrupted checkpoint and offers
+`[c]ontinue audit`, `[r]estart from beginning`, or `[q]uit audit`:
+
+- **Continue** retains completed selection checks in memory and retries the
+  interrupted selection from its beginning, including its primary and deeper
+  probes. Later audit phases retain finished overlap/coverage calculations and
+  retry only unfinished calculations or report writing. Completed evidence is
+  committed once per selection, so continuation cannot double-count it.
+- **Restart** discards this audit's cached work and checks every selected
+  capture again, with counters and elapsed time starting over.
+- **Quit** (or closing input) exits with code
+  130 and prints a rerun command containing both `--resume RUN_DIRECTORY` and
+  `--report-coverage`. A bare `--resume RUN_DIRECTORY` would instead start
+  collection. Saved exports are retained. A previous audit JSON can remain on
+  disk; the interrupted checkpoint does not certify this audit as complete.
+
+Before continuing, the coordinator checks the saved size and modification/change
+timestamps of already audited primary and probe files. A missing or changed
+file invalidates that selection's cached result and dependent overlap/coverage
+calculations, so it is rechecked under the normal hash and validation rules.
+Changed selected references or run identity require starting the audit over.
+Continuation is available only while this process is paused; audit caches are
+not written to disk. Quitting and launching the report again starts a new audit.
+
+The progress checkpoint retains pending candidates and superseded
 attempts. See `sections[UNIT_ID].status`, `selected`, `candidate`, and `error`
 for each selection's current state. Exit codes are 0 for a certified complete
 run, 1 for an incomplete run, 2 for invalid inputs, and 130 for an interruption.
@@ -440,13 +497,23 @@ Linux method. The coordinator prints its PID and the status command at startup.
 `SIGUSR1` also works on macOS/BSD, and `kill -INFO PID` works where `SIGINFO`
 is available. See the [terminal status-character documentation](https://man7.org/linux/man-pages/man3/termios.3.html).
 
-The status report includes captured/verified selection counts, incomplete,
+During collection, the status report includes captured/verified selection counts, incomplete,
 waiting and pending counts, elapsed time, current operation and its duration,
 selection bounds, and saved deeper confirmations for the current attempt. It
 also shows the final coverage/overlap/audit gates separately from captured
-selection counts. Status is printed to stderr without pausing collection,
+selection counts. During coverage auditing, status instead shows saved
+selections checked, validated/failed/remaining counts, audit elapsed time, the
+current audit stage and operation, and relevant selection bounds. It omits the
+collection waiting/pending counts, partial-attempt probe counts, and transient
+coverage gates. These audit counters also apply while a collection run performs
+its final audit. A restarted audit begins its counters again at zero; a continued
+audit retains completed counts and its original elapsed-time clock.
+
+Status is printed to stderr without pausing the current operation,
 sending commands, writing checkpoints, or starting a fresh audit.
-Ctrl-C saves a checkpoint and offers retry or quit; a second Ctrl-C aborts.
+During collection, Ctrl-C saves a checkpoint and offers retry or quit. During
+standalone reporting, it offers continue, restart audit, or quit as described above. A
+second Ctrl-C aborts.
 
 ## Geometry and completeness
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -64,9 +65,13 @@ class RunStatus:
         self.started = time.monotonic()
         self.activity = ("Starting", self.started, None)
         self.handling_signal = False
+        self.operation = 'capture'
+        self.audit_source = None
 
-    def configure(self, cuboids: list[Cuboid], state: dict[str, Any]) -> None:
+    def configure(self, cuboids: list[Cuboid], state: dict[str, Any], *,
+                  operation: str = 'capture', audit_source=None) -> None:
         self.cuboids, self.state = cuboids, state
+        self.operation, self.audit_source = operation, audit_source
 
     def set_activity(self, description: str, region: Cuboid | None = None,
                      clear_region: bool = False) -> None:
@@ -76,6 +81,21 @@ class RunStatus:
 
     def status_text(self) -> str:
         now = time.monotonic()
+        if self.operation=='audit' or (self.audit_source is not None and self.audit_source.auditing):
+            snapshot=self.audit_source.audit_snapshot if self.audit_source is not None else None
+            description,since,region=self.activity
+            if snapshot is None:
+                text=f'Coverage audit status (PID {os.getpid()}): preparing audit.'
+            else:
+                checked,total=snapshot['checked'],snapshot['total']
+                text=(f"Coverage audit status (PID {os.getpid()}): {checked}/{total} saved selections checked; "
+                      f"{snapshot['validated']} validated, {snapshot['failed']} failed, {total-checked} remaining. "
+                      f"Audit elapsed {now-snapshot['started']:.0f}s.\n"
+                      f"Audit: {self.state.get('audit_status','not_run')}; stage: {snapshot['stage']}.")
+            text+=f'\nCurrent: {description} ({now-since:.0f}s).'
+            if region:
+                text+='\n'+region_label(region)
+            return text
         sections = self.state.get("sections", {})
         statuses = [sections.get(c.name, {}).get("status", "pending") for c in self.cuboids]
         done, total = statuses.count("complete"), len(self.cuboids)
@@ -326,7 +346,7 @@ Examples:
     modes.add_argument('--prepare-only',action='store_true',
         help='create/open a run, freeze new-run settings, write its padded preview, and exit; new runs still need player/export/log inputs, but no pane or tmux (default: off)')
     modes.add_argument('--report-coverage',action='store_true',
-        help="audit an existing run's selected files, deeper confirmations, coverage and overlaps; write RUN_ID-audit.json and update its checkpoint; no pane or live log needed (default: off)")
+        help="audit an existing run's selected files, deeper confirmations, coverage and overlaps; write RUN_ID-audit.json and update its checkpoint; Ctrl-C offers continue, restart from the beginning, or quit; no pane or live log needed (default: off)")
     modes.add_argument('--list-exports',action='store_true',
         help='inventory an existing stopped run: recheck selected file hashes and write RUN_ID-exports.json plus primary/required/unused filename lists inside the run directory; excludes pending/unvalidated data; no pane or live log needed (default: off)')
 
@@ -354,7 +374,7 @@ Examples:
 
     interaction=parser.add_argument_group('collection output and interaction')
     interaction.add_argument('--verbose',action='store_true',
-        help='show each completed deeper probe, export/probe counts in results, successful shared-block comparisons, saved-export filenames, and every audit/inventory selection (default: off); normal output samples long probe runs; detailed stages remain available through the status signal')
+        help='show each completed deeper probe, export/probe counts in results, successful shared-block comparisons, saved-export filenames, and every inventory selection (default: off); audits always show each saved selection with timed progress; normal capture output samples long probe runs; detailed stages remain available through the status signal')
     interaction.add_argument('--step-by-step',action='store_true',
         help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; collection only (default: off)')
     interaction.add_argument('--recovery-timeout',type=int,default=DEFAULT_RECOVERY_TIMEOUT,metavar='SECONDS',
@@ -437,19 +457,26 @@ def _main(status_reporter: RunStatus) -> int:
         return 130
     except (OSError,ValueError,KeyError,TypeError) as exc:
         parser.error(str(exc))
-    status_reporter.configure([Cuboid(unit['index'],**unit['core'],name=unit['id']) for unit in run.state['units']],run.state)
+    status_reporter.configure([Cuboid(unit['index'],**unit['core'],name=unit['id']) for unit in run.state['units']],run.state,
+                              operation='audit' if args.report_coverage else 'capture',audit_source=run)
     def activity(description,unit=None):
         report_activity(description,Cuboid(unit['index'],**unit['capture'],name=unit['id']) if unit else None,
                         clear_region=unit is None)
     run.activity=activity
     run.verbose=args.verbose
     run.recovery_handler=lambda unit,problem:recovery_prompt(run,unit,problem,args.recovery_timeout)
-    print(f"Operational model: {run.state['operational_model']} ({capture_run.SCHEMA})",flush=True)
-    print(f"Export prefix: {run.state['prefix']}",flush=True)
+    if args.report_coverage:
+        print('Coverage audit of saved export files (no server commands).',flush=True)
+    else:
+        print(f"Operational model: {run.state['operational_model']} ({capture_run.SCHEMA})",flush=True)
+        print(f"Export prefix: {run.state['prefix']}",flush=True)
     print(f"Run ID: {run.state['run_id']}\nPlan SHA256: {run.plan['plan_hash']}\nRun directory: {run.directory}\nProgress: {run.path}",flush=True)
-    print(f"Preview: {run.directory/(run.state['run_id']+'-preview.svg')}\n"
-          f"{len(run.units)} raw selections; {run.state['settings']['overlap']}-block overlaps; "
-          f"required coverage through Y={run.state['settings']['coverage_y']}.",flush=True)
+    if args.report_coverage:
+        print(f"Report: {run.directory/(run.state['run_id']+'-audit.json')}",flush=True)
+    else:
+        print(f"Preview: {run.directory/(run.state['run_id']+'-preview.svg')}\n"
+              f"{len(run.units)} raw selections; {run.state['settings']['overlap']}-block overlaps; "
+              f"required coverage through Y={run.state['settings']['coverage_y']}.",flush=True)
     print_status_help()
     if not (args.preview or args.prepare_only or args.report_coverage or args.list_exports):
         if not Path(run.state['source']['server_log']).is_file() or not run.export_dir.is_dir():
@@ -478,30 +505,46 @@ def _main(status_reporter: RunStatus) -> int:
             if args.preview or args.prepare_only:
                 run.preview()
                 return 0
+            continue_audit=False
             while True:
                 try:
                     if args.report_coverage:
-                        return 0 if run.audit()['finished'] else 1
+                        report=run.audit(continue_previous=True) if continue_audit else run.audit()
+                        return 0 if report['finished'] else 1
                     return run.collect(confirm=args.step_by_step)
                 except KeyboardInterrupt:
                     signal.signal(signal.SIGINT,abort_immediately)
                     run.state.update(finished=False,audit_status='interrupted')
                     run.save()
-                    print('\nPaused; run checkpoint saved. Ctrl-C again aborts.',flush=True)
+                    if args.report_coverage:
+                        report_activity('Coverage audit paused; choose continue, restart from the beginning, or quit')
+                        print('\nCoverage audit paused; checkpoint saved. Ctrl-C again aborts.',flush=True)
+                        print('Continue keeps completed checks and retries the interrupted selection or audit phase.',flush=True)
+                        prompt='[c]ontinue audit, [r]estart from beginning, [q]uit audit: '
+                    else:
+                        print('\nPaused; run checkpoint saved. Ctrl-C again aborts.',flush=True)
+                        prompt='[r]etry unfinished work, [q]uit: '
                     try:
-                        choice=input('[r]etry unfinished work, [q]uit: ').strip().lower()
+                        choice=input(prompt).strip().lower()
                     except (KeyboardInterrupt,EOFError):
                         choice='q'
-                    if choice=='r':
+                    if choice=='r' or (choice=='c' and args.report_coverage):
+                        continue_audit=choice=='c'
                         signal.signal(signal.SIGINT,original_handler)
                         continue
-                    print(f'Stopped. Restart with the same plan to continue, or use --resume {run.directory}',flush=True)
+                    if args.report_coverage:
+                        command=shlex.join([sys.executable,'-B',str(Path(__file__).resolve()),
+                                            '--resume',str(run.directory),'--report-coverage'])
+                        print(f'Coverage audit stopped; checkpoint saved.\nRerun the audit with:\n  {command}',flush=True)
+                    else:
+                        print(f'Stopped. Restart with the same plan to continue, or use --resume {run.directory}',flush=True)
                     signal.signal(signal.SIGINT,original_handler)
                     return 130
                 except (OSError,ValueError,KeyError,TypeError) as exc:
                     run.state.update(finished=False,audit_status='failed',last_error=str(exc))
                     run.save()
-                    print(f'Run incomplete: {exc}\nProgress: {run.path}',file=sys.stderr,flush=True)
+                    label='Coverage audit failed' if args.report_coverage else 'Run incomplete'
+                    print(f'{label}: {exc}\nProgress: {run.path}',file=sys.stderr,flush=True)
                     return 1
                 finally:
                     signal.signal(signal.SIGINT,original_handler)
