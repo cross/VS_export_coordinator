@@ -7,21 +7,14 @@ __pycache__/
 /capture-plans/*/plan.svg
 /capture-plans/*/plan.png
 
-# Generated commands, checkpoints, and audit reports
-*-commands/
+# Generated run checkpoints, previews, and audit reports
 *-progress.json
-*-coverage.json
 *-audit.json
-*-coverage.svg
-*-columns.svg
+*-preview.svg
 *.json.tmp
-*.previous-invalid*.json
 
 # Optional dedicated directory for collected world exports
 /exports/
 
-# Local repair jobs, source backups, and server response records
-/repairs/
-*.json.repair-tmp
-*.json.rescan-tmp
-*.before-rescan-*.json
+# Current capture run records and server responses
+/capture-runs/

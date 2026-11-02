@@ -139,12 +139,12 @@ class PlanTests(unittest.TestCase):
             self.assertLessEqual(task['zmax'] - task['zmin'] + 1, 50)
             self.assertLessEqual(p.volume(task), 2_610_000)
 
-    def test_older_saved_plan_without_operational_x_cap_still_loads(self):
-        old = p.create_plan(65, 180, self.geometry, x_span=1023)
-        del old['partition']['x_span']
-        old['plan_hash'] = p.digest({k: v for k, v in old.items() if k != 'plan_hash'})
-        p.verify_plan(old)
-        self.assertEqual(len(old['cuboids']), 88)
+    def test_plan_without_explicit_operational_x_cap_is_rejected(self):
+        malformed = deepcopy(self.banded)
+        del malformed['partition']['x_span']
+        malformed['plan_hash'] = p.digest({k: v for k, v in malformed.items() if k != 'plan_hash'})
+        with self.assertRaisesRegex(ValueError, 'explicit X/Z span caps'):
+            p.verify_plan(malformed)
 
     def test_operational_caps_are_checked_even_below_hard_limits(self):
         modified = deepcopy(self.banded)
@@ -193,12 +193,14 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(list(expected.parent.parent.iterdir()), [expected.parent])
             self.assertEqual(p.load_plan(expected), self.banded)
 
-    def test_height_extension_is_separate_nonoverlapping_and_reuses_names(self):
+    def test_height_extension_adds_nonoverlapping_regions_under_new_identity(self):
         a = self.banded['cuboids'][0]
         region = {**p.box(a), 'ymin': 175, 'ymax': 220}
         extended = p.extend_plan(self.banded, [region])
         self.assertNotEqual(extended['prefix'], self.banded['prefix'])
-        self.assertEqual(extended['cuboids'][:len(self.banded['cuboids'])], self.banded['cuboids'])
+        self.assertEqual([p.box(b) for b in extended['cuboids'][:len(self.banded['cuboids'])]],
+                         [p.box(b) for b in self.banded['cuboids']])
+        self.assertTrue(all(b['name'].startswith(extended['prefix']) for b in extended['cuboids']))
         self.assertEqual(extended['parent_plan_hash'], self.banded['plan_hash'])
         self.assertFalse(p.difference([region], extended['cuboids']))
         self.assertEqual(self.banded['requested_y'], dict(ymin=65, ymax=180))
@@ -215,41 +217,19 @@ class PlanTests(unittest.TestCase):
             self.assertEqual([b['selected'] for b in records], [True, False])
             self.assertEqual(p.rows_for_boxes(requests)[2], [(-20, 20)])
 
-    def test_freshwater_extension_preserves_old_exports(self):
+    def test_freshwater_extension_adds_regions_and_retains_partition_bounds(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'lakes.json'
             path.write_text(json.dumps({'bodies': [{'id': 'whole-lake', 'rows': [[60000, -36000, -33000]]}]}))
             extended = p.extend_plan(self.banded, [], path)
-            self.assertEqual(extended['cuboids'][:len(self.banded['cuboids'])], self.banded['cuboids'])
+            self.assertEqual([p.box(b) for b in extended['cuboids'][:len(self.banded['cuboids'])]],
+                             [p.box(b) for b in self.banded['cuboids']])
+            self.assertTrue(all(b['name'].startswith(extended['prefix']) for b in extended['cuboids']))
             lake = dict(xmin=-36000, xmax=-33000, ymin=65, ymax=180, zmin=60000, zmax=60000)
             self.assertFalse(p.difference([lake], extended['requests']))
             self.assertTrue(extended['freshwater_bodies'][0]['selected'])
             self.assertTrue(all(b['xmax']-b['xmin']+1 <= 450 for b in extended['cuboids']))
 
-    def test_full_audit_short_y_corruption_and_offline_coordinator(self):
-        plan = self.banded
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            path = p.write_plan(plan, directory / 'plan.json')
-            for task in plan['cuboids']:
-                (directory / (task['name'] + '.json')).write_text(json.dumps(export_data(task)))
-            full = p.audit_coverage(plan, {}, directory)
-            self.assertTrue(full['complete'])
-            self.assertEqual(full['verified_envelope_blocks'], full['requested_blocks'])
-            task = plan['cuboids'][0]
-            target = directory / (task['name'] + '.json')
-            target.write_text(json.dumps(export_data(task, size_y=100)))
-            partial = p.audit_coverage(plan, {}, directory)
-            self.assertFalse(partial['complete'])
-            self.assertTrue(all(g['ymin'] == 165 and g['ymax'] == 180 for g in partial['gaps']))
-            lost = sum(p.volume(o) for r in plan['requests'] if (o := p.intersection(r, {**p.box(task), 'ymin': 165})))
-            self.assertEqual(full['requested_blocks']-partial['verified_envelope_blocks'], lost)
-            target.write_text('{broken')
-            corrupt = p.audit_coverage(plan, {}, directory)
-            self.assertFalse(corrupt['complete'])
-            args = ['coordinator', '--plan', str(path), '--export-dir', str(directory), '--report-coverage']
-            with patch('sys.argv', args), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', side_effect=AssertionError('No prompts allowed')), patch('sys.stdout', new=io.StringIO()):
-                self.assertEqual(coordinator.main(), 1)
 
     def test_default_plan_preview_and_missing_plan_never_fall_back(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,23 +249,6 @@ class PlanTests(unittest.TestCase):
                     coordinator.main()
                 self.assertEqual(error.exception.code, 2)
 
-    def test_coordinator_reuses_existing_exports_and_resumes_without_commands(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            path = p.write_plan(self.banded, directory / 'plan.json')
-            sentinel = directory / 'channel_capture-progress.json'
-            sentinel.write_text('legacy run must stay untouched')
-            for task in self.banded['cuboids']:
-                (directory / (task['name']+'.json')).write_text(json.dumps(export_data(task)))
-            args = ['coordinator', '--plan', str(path), '--target-pane', '%9', '--export-dir', str(directory)]
-            for _ in range(2):
-                with patch('sys.argv', args), patch('subprocess.run', side_effect=AssertionError('No commands allowed')), patch('builtins.input', return_value=''), patch('sys.stdout', new=io.StringIO()):
-                    self.assertEqual(coordinator.main(), 0)
-            state = p.read_json(directory / (self.banded['prefix']+'-progress.json'))
-            self.assertTrue(state['finished'])
-            self.assertEqual(state['signature']['capture_plan_hash'], self.banded['plan_hash'])
-            self.assertEqual(sentinel.read_text(), 'legacy run must stay untouched')
-
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -303,6 +266,12 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(self.inspect(data)['ceiling_blocks'], 1)
         data['BlockCodes']['1'] = 'game:air'
         self.assertEqual(self.inspect(data)['ceiling_blocks'], 0)
+
+    def test_shortened_height_leaves_exact_upper_gap(self):
+        result=self.inspect(export_data(self.b,size_y=100))
+        self.assertFalse(result['problems'])
+        self.assertEqual(result['covered'],{**self.b,'ymax':164})
+        self.assertEqual(p.difference([self.b],result['verified_regions']),[{**self.b,'ymin':165}])
 
     def test_malformed_out_of_bounds_empty_and_decor(self):
         bad = []
@@ -325,58 +294,8 @@ class EvidenceTests(unittest.TestCase):
         evidence = self.inspect(data)
         self.assertFalse(evidence['problems'])
         self.assertEqual(evidence['layered_positions'], 2)
-        c = coordinator.Cuboid(1, **self.b, name='piece')
-        self.assertFalse(coordinator.validate_export(self.path, c))
         self.assertEqual(json.loads(self.path.read_text()), data)
 
-    def test_resume_can_use_valid_parent_instead_of_old_failed_splits(self):
-        data = export_data(self.b)
-        data['Indices'].append(0)
-        data['BlockIds'].append(2)
-        data['BlockCodes']['2'] = 'game:saltwater-still-7'
-        self.inspect(data)
-        c = coordinator.Cuboid(1, **self.b, name='piece')
-        previous = {'segmented': True, 'status': 'partial', 'children': [{'name': 'missing'}],
-                    'gaps': [self.b], 'problems': ['Duplicate block indices']}
-        record = coordinator.validated_export_record(c, self.path, previous)
-        self.assertEqual(record['status'], 'complete')
-        self.assertNotIn('children', record)
-        self.assertNotIn('segmented', record)
-        self.assertNotIn('gaps', record)
-
-    def test_audit_checks_valid_parent_and_pending_children(self):
-        directory = Path(self.temp.name)
-        parent = {**self.b, 'name': 'piece'}
-        left, right = {**self.b, 'xmax': -1}, {**self.b, 'xmin': 0}
-        (directory/'left.json').write_text(json.dumps(export_data(left)))
-        (directory/'right.json').write_text(json.dumps(export_data(right)))
-        state = {'sections': {'piece': {'status': 'partial', 'segmented': True,
-                  'piece_regions': [{**left, 'file': 'left.json'}],
-                  'children': [{**right, 'name': 'right'}]}}}
-        plan = dict(cuboids=[parent], requests=[self.b], world_center=p.WORLD_CENTER,
-                    plan_hash='test', geometry_hash='test')
-        self.assertTrue(p.audit_coverage(plan, state, directory)['complete'])
-        self.path.write_text(json.dumps(export_data(self.b)))
-        self.assertTrue(p.audit_coverage(plan, state, directory)['complete'])
-
-    def test_merge_preserves_two_layers_at_each_position(self):
-        directory = Path(self.temp.name)
-        parent = coordinator.Cuboid(1, **self.b, name='parent')
-        pieces = []
-        for name, bounds in (('left', {**self.b, 'xmax': -1}), ('right', {**self.b, 'xmin': 0})):
-            c = coordinator.Cuboid(1, **bounds, name=name)
-            data = export_data(bounds)
-            data['Indices'].append(0)
-            data['BlockIds'].append(2)
-            data['BlockCodes']['2'] = 'game:saltwater-still-7'
-            path = directory/(name+'.json')
-            path.write_text(json.dumps(data))
-            pieces.append((c, path))
-        coordinator.merge_exports(parent, pieces, self.path)
-        merged = json.loads(self.path.read_text())
-        self.assertEqual([b for i,b in zip(merged['Indices'],merged['BlockIds']) if i == 0], [1, 2])
-        self.assertEqual([b for i,b in zip(merged['Indices'],merged['BlockIds']) if i == 5], [1, 2])
-        self.assertFalse(coordinator.validate_export(self.path, parent))
 
     def test_internal_column_holes_are_exact_and_excluded_from_audit(self):
         data = export_data(self.b)
@@ -389,13 +308,8 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence['column_presence']['missing_columns'],4)
         self.assertEqual(evidence['column_presence']['missing_regions'],
             [dict(xmin=-3,xmax=-2,ymin=65,ymax=180,zmin=7,zmax=8)])
-        c = coordinator.Cuboid(1,**self.b,name='piece')
-        self.assertTrue(any('4 X/Z columns' in e for e in coordinator.validate_export(self.path,c)))
-        plan = dict(cuboids=[{**self.b,'name':'piece'}],requests=[self.b],
-                    world_center=p.WORLD_CENTER,plan_hash='test',geometry_hash='test')
-        audit = p.audit_coverage(plan,{},Path(self.temp.name))
-        self.assertEqual(audit['column_presence']['missing_columns'],4)
-        self.assertEqual(audit['requested_blocks']-audit['verified_envelope_blocks'],4*116)
+        missing_volume = sum(p.volume(b) for b in p.difference([self.b], evidence['verified_regions']))
+        self.assertEqual(missing_volume,4*116)
 
     def test_decor_counts_as_column_presence_without_a_block_record(self):
         data = export_data(self.b)
@@ -404,77 +318,6 @@ class EvidenceTests(unittest.TestCase):
         data['DecorIndices'] = [9 | (9 << 10)]
         data['DecorIds'] = [1]
         self.assertEqual(self.inspect(data)['column_presence']['missing_columns'],0)
-
-    def test_oversized_merge_rejected_before_writing(self):
-        c = coordinator.Cuboid(1, 0, 1023, 0, 5, 0, 5, 'too_wide')
-        with self.assertRaisesRegex(ValueError, 'Cannot merge'):
-            coordinator.merge_exports(c, [], self.path)
-        self.assertFalse(self.path.exists())
-
-    def test_command_execution_keeps_existing_protocol_and_records_height(self):
-        directory = Path(self.temp.name)
-        c = coordinator.Cuboid(1, **self.b, name='v12_test')
-        output = directory / 'v12_test.json'
-        def simulate_server(*args, **kwargs):
-            output.write_text(json.dumps(export_data(self.b, ceiling=True)))
-        state = {'signature': {'capture_plan_hash': 'test'}, 'sections': {}}
-        state_path = directory / 'progress.json'
-        with patch('subprocess.run', side_effect=simulate_server) as sent, patch.object(coordinator, 'stable_file', return_value=True), patch('sys.stdout', new=io.StringIO()):
-            status, problems = coordinator.run_export_attempt(c, 'Player', '%9', directory, directory, state, state_path, confirm=False, verbose=False)
-        self.assertEqual((status, problems), ('complete', []))
-        self.assertEqual(sent.call_count, 1)
-        self.assertEqual(sent.call_args.args[0][0], 'tmux')
-        command = (directory / 'v12_test.txt').read_text()
-        self.assertEqual(command, '/executeas Player /we select -5 65 4 4 180 13\n/executeas Player /we export v12_test\n')
-        self.assertEqual(state['sections'][c.name]['ceiling_blocks'], 1)
-
-    def test_merged_provenance_cannot_hide_child_y_gap_without_progress(self):
-        # One X half is short, the other reaches full height. A merged SizeY
-        # alone would falsely imply the first half's upper volume was captured.
-        parent = coordinator.Cuboid(1, **self.b, name='parent')
-        left = coordinator.Cuboid(1, **{**self.b, 'xmax': -1}, name='left')
-        right = coordinator.Cuboid(1, **{**self.b, 'xmin': 0}, name='right')
-        directory = Path(self.temp.name)
-        pieces = []
-        for c, sy in ((left, 100), (right, 116)):
-            path = directory / (c.name+'.json')
-            path.write_text(json.dumps(export_data(coordinator.cuboid_record(c), size_y=sy)))
-            pieces.append((c, path))
-        coordinator.merge_exports(parent, pieces, directory / 'parent.json')
-        plan = dict(cuboids=[{**self.b, 'name': 'parent'}], requests=[self.b], world_center=p.WORLD_CENTER,
-                    plan_hash='test', geometry_hash='test')
-        audit = p.audit_coverage(plan, {}, directory)
-        self.assertEqual(audit['gaps'], [{**self.b, 'xmax': -1, 'ymin': 165}])
-
-    def test_keep_returned_part_records_missing_height(self):
-        c = coordinator.Cuboid(1, **self.b, name='v12_test')
-        lower = {**self.b, 'ymax': 164}
-        self.assertEqual(coordinator.uncovered_remainder(c, lower), [{**self.b, 'ymin': 165}])
-
-    def test_custom_tmux_survives_retry_teleport_and_subdivision(self):
-        directory = Path(self.temp.name)
-        c = coordinator.Cuboid(1, **self.b, name='v12_test')
-        state = {'signature': {'capture_plan_hash': 'test'}, 'sections': {}}
-        reporter = coordinator.RunStatus([c], state)
-        def simulate_server(command, **kwargs):
-            text = Path(command[2]).read_text()
-            if text.startswith('/gm'):
-                return
-            selection, export = text.splitlines()
-            coords = map(int, selection.split()[4:])
-            region = dict(zip(('xmin', 'ymin', 'zmin', 'xmax', 'ymax', 'zmax'), coords))
-            name = export.split()[-1]
-            data = export_data(region)
-            if name == c.name:
-                data['SizeX'] -= 1  # Force retry, teleport, and then a split.
-            (directory / (name+'.json')).write_text(json.dumps(data))
-        with patch('subprocess.run', side_effect=simulate_server) as sent, patch.object(coordinator, 'stable_file', return_value=True), patch('time.sleep'), patch('sys.stdout', new=io.StringIO()):
-            pieces, gaps = coordinator.recover_automatically(c, 0, 'Player', '%9', directory,
-                directory, state, directory/'progress.json', reporter, tmux_binary='/custom/tmux')
-        self.assertEqual(len(pieces), 2)
-        self.assertFalse(gaps)
-        self.assertEqual(sent.call_count, 5)
-        self.assertTrue(all(call.args[0][0] == '/custom/tmux' for call in sent.call_args_list))
 
 
 if __name__ == '__main__':

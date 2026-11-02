@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 # vim:et sts=4 sw=4
-"""Collect and verify Vintage Story WorldEdit exports from a saved coastline plan.
+"""Capture a saved coastline plan in an isolated, resumable WorldEdit run.
 
-The saved plan defines the normal selection bounds, heights, and export
-names. Empty columns can trigger retained, chunk-sized deeper diagnostic
-exports without changing the plan. The default plan is
-capture-plans/coastal-connection/plan.json beside this
-script; v12_capture_plan.py creates and revises that specification.
-This program never edits terrain. It writes `/we select` and `/we export`
-commands to a file, pastes them to the confirmed tmux pane, then watches the
-chosen WorldEdit export directory for the resulting JSON file.
-In automatic mode, Ctrl-C pauses with retry/quit choices; retry restarts the
-unfinished selection while preserving validated exports. A second Ctrl-C
-exits immediately using the last completed checkpoint.
+New runs preload selections, write uniquely named immutable raw exports, retry
+whole sections, and compare overlapping block-code multisets. Compatible runs
+continue automatically using manifest-bound evidence. No terrain is edited.
 """
 
 from __future__ import annotations
@@ -20,8 +12,6 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import signal
@@ -31,16 +21,12 @@ import time
 from typing import Any
 
 import v12_capture_plan as capture_plan
-import capture_rescan
+import server_console
+import capture_run
 
 
-WORLD_CENTER = capture_plan.WORLD_CENTER
 DEFAULT_PLAN = Path(__file__).resolve().parent / "capture-plans" / "coastal-connection" / "plan.json"
 DEFAULT_PLAYER = "Xplosionist"
-STABILITY_SECONDS = 2.0
-POLL_SECONDS = 0.5
-AUTO_TELEPORT_DELAY = 1.5
-STATUS_INTERVAL = 60.0
 
 
 @dataclass(frozen=True)
@@ -67,285 +53,11 @@ def region_label(c: Cuboid) -> str:
             f"Z {c.zmin}..{c.zmax} ({sx}×{sy}×{sz})")
 
 
-def reported_export_size(path: Path) -> str:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return f"{data.get('SizeX')}×{data.get('SizeY')}×{data.get('SizeZ')}"
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return "unknown dimensions"
-
-
-def expected_export(c: Cuboid) -> dict[str, Any]:
-    return {
-        "SizeX": c.size[0], "SizeY_max": c.size[1], "SizeZ": c.size[2],
-        "OriginalPos": {"X": c.xmin + WORLD_CENTER,
-                        "Z": c.zmin + WORLD_CENTER,
-                        "InternalY": c.ymin},
-    }
-
-
-def split_largest_dimension(c: Cuboid, prefix: str) -> tuple[Cuboid, Cuboid]:
-    """Bisect the longest side; ties prefer X, then Z, then Y."""
-    lengths = c.size
-    axis = max(range(3), key=lambda i: (lengths[i], -({0: 0, 2: 1, 1: 2}[i])))
-    starts = [c.xmin, c.ymin, c.zmin]
-    ends = [c.xmax, c.ymax, c.zmax]
-    mid = (starts[axis] + ends[axis]) // 2
-    children = []
-    for part, (lo, hi) in enumerate(((starts[axis], mid), (mid + 1, ends[axis])), 1):
-        child_starts, child_ends = starts.copy(), ends.copy()
-        child_starts[axis], child_ends[axis] = lo, hi
-        name = (f"{prefix}_seg{part}_x{child_starts[0]}_{child_ends[0]}"
-                f"_z{child_starts[2]}_{child_ends[2]}")
-        children.append(Cuboid(c.index, child_starts[0], child_ends[0],
-                               child_starts[1], child_ends[1], child_starts[2],
-                               child_ends[2], name))
-    return children[0], children[1]
-
-
-def archive_invalid(path: Path) -> None:
-    if not path.exists():
-        return
-    bad = path.with_name(path.stem + ".previous-invalid.json")
-    n = 1
-    while bad.exists():
-        bad = path.with_name(path.stem + f".previous-invalid-{n}.json")
-        n += 1
-    path.rename(bad)
-
-
-def merge_exports(parent: Cuboid, pieces: list[tuple[Cuboid, Path]], destination: Path) -> None:
-    """Combine WorldEdit sparse block records into one parent-coordinate JSON."""
-    if parent.size[0] > 1023 or parent.size[2] > 1023:
-        raise ValueError("Cannot merge an export wider/deeper than the 1023-block packed-index safety limit")
-    parent_origin = expected_export(parent)["OriginalPos"]
-    merged: dict[str, Any] | None = None
-    max_y = 0
-    for piece, path in pieces:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if merged is None:
-            merged = dict(data)
-            merged["Indices"] = []
-            merged["BlockIds"] = []
-            merged["DecorIndices"] = []
-            merged["DecorIds"] = []
-            merged["BlockEntities"] = {}
-            merged["Entities"] = []
-            merged["BlockCodes"] = {}
-            merged["ItemCodes"] = {}
-        assert merged is not None
-        for palette_key in ("BlockCodes", "ItemCodes"):
-            for key, value in data.get(palette_key, {}).items():
-                if key in merged[palette_key] and merged[palette_key][key] != value:
-                    raise ValueError(f"Conflicting {palette_key} entry {key}")
-                merged[palette_key][key] = value
-
-        source_origin = data["OriginalPos"]
-        dx = source_origin["X"] - parent_origin["X"]
-        dz = source_origin["Z"] - parent_origin["Z"]
-        dy = source_origin["InternalY"] - parent_origin["InternalY"]
-        max_y = max(max_y, dy + data["SizeY"])
-
-        def reindex(index: int) -> int:
-            # WorldEdit packs local coordinates as X + (Z << 10) + (Y << 20).
-            x = index & 1023
-            z = (index >> 10) & 1023
-            y = index >> 20
-            x += dx
-            z += dz
-            y += dy
-            if not (0 <= x < parent.size[0] and 0 <= z < parent.size[2] and 0 <= y < parent.size[1]):
-                raise ValueError(f"Piece index {index} maps outside parent export bounds")
-            return x | (z << 10) | (y << 20)
-
-        merged["Indices"].extend(reindex(i) for i in data.get("Indices", []))
-        merged["BlockIds"].extend(data.get("BlockIds", []))
-        merged["DecorIndices"].extend(reindex(i) for i in data.get("DecorIndices", []))
-        merged["DecorIds"].extend(data.get("DecorIds", []))
-        for key, value in data.get("BlockEntities", {}).items():
-            new_key = str(reindex(int(key)))
-            if new_key in merged["BlockEntities"]:
-                raise ValueError(f"Overlapping block entity at merged index {new_key}")
-            merged["BlockEntities"][new_key] = value
-        merged["Entities"].extend(data.get("Entities", []))
-
-    if merged is None:
-        raise ValueError("No complete segment exports are available to merge")
-    merged["SizeX"] = parent.size[0]
-    merged["SizeY"] = max(1, min(parent.size[1], max_y))
-    merged["SizeZ"] = parent.size[2]
-    merged["OriginalPos"] = parent_origin
-    # Preserve leaf evidence inside generated merges, including when a new
-    # extension plan reuses the file without the old progress record.
-    merged["CapturePlanPieces"] = [{"file": path.name, **cuboid_record(piece)}
-                                   for piece, path in pieces]
-    tmp = destination.with_suffix(destination.suffix + ".tmp")
-    tmp.write_text(json.dumps(merged, separators=(",", ":")), encoding="utf-8")
-    tmp.replace(destination)
-
-
-def validate_export(path: Path, c: Cuboid, *, evidence: dict | None = None) -> list[str]:
-    problems: list[str] = []
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return [f"Could not read valid JSON: {exc}"]
-    if not isinstance(data, dict):
-        return ["Export root is not an object"]
-
-    expected = expected_export(c)
-    size_y = data.get("SizeY")
-    if not isinstance(size_y, int) or not 1 <= size_y <= expected["SizeY_max"]:
-        problems.append(f"SizeY is {size_y!r}; expected 1..{expected['SizeY_max']} (empty upper space may be omitted)")
-    origin = data.get("OriginalPos")
-    if not isinstance(origin, dict):
-        problems.append("OriginalPos is missing or is not an object")
-    else:
-        for key, value in expected["OriginalPos"].items():
-            if origin.get(key) != value:
-                problems.append(f"OriginalPos.{key} is {origin.get(key)!r}; expected {value}")
-
-    indices, block_ids = data.get("Indices"), data.get("BlockIds")
-    if not isinstance(indices, list) or not isinstance(block_ids, list):
-        problems.append("Indices or BlockIds is missing or is not an array")
-    elif len(indices) != len(block_ids):
-        problems.append(f"Indices has {len(indices)} entries but BlockIds has {len(block_ids)}")
-    for key in ("DecorIndices", "DecorIds"):
-        if key in data and not isinstance(data[key], list):
-            problems.append(f"{key} is not an array")
-    if evidence is None:
-        evidence = capture_plan.inspect_export(path, cuboid_record(c))
-    problems.extend(evidence["problems"])
-    columns = evidence.get("column_presence", {})
-    missing = columns.get("unverified_columns", columns.get("missing_columns", 0))
-    if missing:
-        problems.append(f"{missing} X/Z columns have no block/decor record at any returned height; column coverage is unverified")
-    return problems
-
-
-def validated_export_record(c: Cuboid, path: Path, previous: dict | None = None,
-                            *, evidence: dict | None = None) -> dict:
-    """Replace failed-split state when a usable direct parent export exists."""
-    if evidence is None:
-        evidence = capture_plan.inspect_export(path, cuboid_record(c))
-    if evidence["problems"] or evidence["covered"] is None:
-        raise ValueError("Cannot checkpoint an invalid export: " + "; ".join(evidence["problems"]))
-    if evidence.get("column_presence", {}).get("unverified_columns"):
-        raise ValueError("Cannot checkpoint an export with unverified empty columns")
-    # Keep evidence for a locally merged file: its envelope must not conceal a
-    # missing upper layer in an individual piece. Direct WorldEdit files can
-    # supersede the recovery tree that the earlier validator created for them.
-    retained = previous if previous and previous.get("merged") else {}
-    record = {**retained, "status": "complete", "file": str(path),
-              "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-              "returned_bounds": evidence["covered"], "ceiling_blocks": evidence["ceiling_blocks"],
-              "column_presence": evidence["column_presence"]}
-    if evidence.get("pieces"):
-        pieces = [{**item, "file": str(path.parent / Path(item["file"]).name)} for item in evidence["pieces"]]
-        record.update(merged=True, segmented=True, piece_regions=pieces,
-                      pieces=[item["file"] for item in pieces], gaps=[])
-    return record
-
-
-def returned_export_bounds(path: Path, c: Cuboid) -> dict[str, int] | None:
-    """Return the independently validated, reported three-dimensional envelope."""
-    return capture_plan.inspect_export(path, cuboid_record(c))["covered"]
-
-
-def cuboid_record(c: Cuboid) -> dict[str, int]:
-    return {"xmin": c.xmin, "xmax": c.xmax, "ymin": c.ymin,
-            "ymax": c.ymax, "zmin": c.zmin, "zmax": c.zmax}
-
-
-def cuboid_from_record(parent: Cuboid, bounds: dict[str, int], name: str) -> Cuboid:
-    return Cuboid(parent.index, bounds["xmin"], bounds["xmax"], bounds["ymin"],
-                  bounds["ymax"], bounds["zmin"], bounds["zmax"], name)
-
-
-def uncovered_remainder(c: Cuboid, returned: dict[str, int] | None) -> list[dict[str, int]]:
-    """Return exact missing X/Y/Z regions, without treating shortened Y as air."""
-    return capture_plan.difference([cuboid_record(c)], [returned] if returned else [])
-
-
-def update_collection_completion(state: dict[str, Any]) -> None:
-    """Collection completion is independent of the conservative 3D audit."""
-    planned = state.get("planned_sections")
-    if not isinstance(planned, list) or not planned:
-        return
-    sections = state.get("sections", {})
-    verified = [name for name in planned if sections.get(name, {}).get("status") == "complete"
-                and not sections[name].get("gaps")]
-    accepted = [name for name in planned if sections.get(name, {}).get("status") == "accepted"]
-    resolved = set(verified) | set(accepted)
-    state["finished"] = len(resolved) == len(planned)
-    state["completion"] = {
-        "version": 2, "planned_selections": len(planned), "resolved_selections": len(resolved),
-        "verified_selections": len(verified), "manually_accepted_selections": len(accepted),
-        "unresolved_selections": [name for name in planned if name not in resolved],
-        "basis": "All planned root selections are complete or manually accepted; coverage is audited separately.",
-    }
-
-
-def save_state(path: Path, state: dict[str, Any]) -> None:
-    update_collection_completion(state)
-    state["updated_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    manifest_path = path.with_name(path.stem.replace("-progress", "-coverage") + ".json")
-    manifest = {
-        "signature": state.get("signature"), "updated_utc": state["updated_utc"],
-        "coverage_basis": "Execution checkpoint only. Use the saved plan's independent 3D audit for verified coverage and exact height gaps.",
-        "sections": state.get("sections", {}),
-        **{key: state[key] for key in ("finished", "completion", "coverage_complete",
-                                      "column_coverage_complete", "audit_status") if key in state},
-    }
-    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    manifest_tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    manifest_tmp.replace(manifest_path)
-
-
-def load_state(path: Path, signature: dict[str, Any]) -> dict[str, Any]:
-    if path.exists():
-        old = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(old, dict) or old.get("signature") != signature:
-            raise ValueError("Existing progress uses another plan/export directory; refusing to overwrite it")
-        return old
-    return {"signature": signature, "sections": {}, "updated_utc": None}
-
-
-def stable_file(path: Path, quit_check) -> bool:
-    previous: tuple[int, int] | None = None
-    stable_since: float | None = None
-    while True:
-        if quit_check():
-            return False
-        try:
-            stat = path.stat()
-            current = (stat.st_size, stat.st_mtime_ns)
-        except FileNotFoundError:
-            previous, stable_since = None, None
-            time.sleep(POLL_SECONDS)
-            continue
-        if current[0] == 0:
-            previous, stable_since = current, None
-        elif current == previous:
-            if stable_since is None:
-                stable_since = time.monotonic()
-            elif time.monotonic() - stable_since >= STABILITY_SECONDS:
-                return True
-        else:
-            previous, stable_since = current, None
-        time.sleep(POLL_SECONDS)
-
-
 class RunStatus:
     def __init__(self, cuboids: list[Cuboid], state: dict[str, Any]):
         self.cuboids = cuboids
         self.state = state
         self.started = time.monotonic()
-        self.last_report = self.started
         self.activity = ("Starting", self.started, None)
         self.handling_signal = False
 
@@ -362,26 +74,26 @@ class RunStatus:
         now = time.monotonic()
         sections = self.state.get("sections", {})
         statuses = [sections.get(c.name, {}).get("status", "pending") for c in self.cuboids]
-        verified, accepted = statuses.count("complete"), statuses.count("accepted")
-        done, total = verified + accepted, len(self.cuboids)
-        partial = sum(s in ("partial", "incomplete") for s in statuses)
+        done, total = statuses.count("complete"), len(self.cuboids)
+        partial = statuses.count("incomplete")
         active = statuses.count("waiting")
         pending = total - done - partial - active
         description, since, region = self.activity
-        count_text = f"{verified} verified"
-        if accepted > 0:
-            count_text += f", {accepted} manually accepted"
-        text = (f"Status (PID {os.getpid()}): {done}/{total} selections finished "
-                f"({100 * done / total if total else 0:.1f}%; {count_text}); "
+        text = (f"Status (PID {os.getpid()}): {done}/{total} selections captured "
+                f"({100 * done / total if total else 0:.1f}%; {done} verified); "
                 f"{partial} partial/incomplete, {active} waiting, {pending} pending. "
                 f"Elapsed {now - self.started:.0f}s.\nCurrent: {description} ({now - since:.0f}s).")
+        text += (f"\nRun finished: {self.state.get('finished',False)}; "
+                 f"required coverage: {self.state.get('coverage_complete')}; "
+                 f"overlaps: {self.state.get('overlap_complete')}; "
+                 f"audit: {self.state.get('audit_status','not_run')}.")
         if region:
             text += "\n" + region_label(region)
-            checkpoint = self.state.get("column_rescans", {}).get("sections", {}).get(region.name, {})
-            if "unverified_columns" in checkpoint:
-                text += (f"\nLast rescan checkpoint: {checkpoint.get('restored_columns', 0):,} columns restored, "
-                         f"{checkpoint.get('empty_columns_confirmed_by_rescan', 0):,} empty bands corroborated, "
-                         f"{checkpoint['unverified_columns']:,} unverified.")
+            candidate = sections.get(region.name, {}).get("candidate")
+            if candidate:
+                text += f"\nSaved deeper confirmations: {len(candidate['probes'])}."
+                if 'unverified_columns' in candidate:
+                    text += f" {candidate['unverified_columns']:,} columns still unverified."
         return text
 
     def on_status_signal(self, signum, frame) -> None:
@@ -396,14 +108,6 @@ class RunStatus:
             pass  # A closed diagnostic stream must not interrupt collection.
         finally:
             self.handling_signal = False
-
-    def maybe_report(self, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now - self.last_report < STATUS_INTERVAL:
-            return
-        print(self.status_text(), flush=True)
-        self.last_report = now
-
 
 ACTIVE_STATUS: RunStatus | None = None
 
@@ -442,510 +146,10 @@ def abort_immediately(signum=None, frame=None) -> None:
     os._exit(130)
 
 
-def try_save_state(state_path: Path, state: dict[str, Any]) -> bool:
-    try:
-        save_state(state_path, state)
-        return True
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"Could not finish saving progress: {exc}. Existing checkpoints are retained.",
-              file=sys.stderr)
-        return False
-
-
-def pause_after_interrupt(state: dict[str, Any], state_path: Path) -> None:
-    """Save once and prompt; another Ctrl-C aborts even during that save."""
-    previous_handler = signal.signal(signal.SIGINT, abort_immediately)
-    try:
-        report_activity("Paused; waiting for retry/quit choice")
-        print("\nPaused. Saving progress ... (Ctrl-C again aborts)", flush=True)
-        try_save_state(state_path, state)
-        while True:
-            choice = input("[r]etry unfinished selection, [q]uit: ").strip().lower()
-            if choice == "r":
-                print("Resuming.")
-                signal.signal(signal.SIGINT, previous_handler)
-                return
-            if choice == "q":
-                # Keep the emergency handler installed during the final save.
-                raise UserQuit
-            print("Choose r or q; Ctrl-C again aborts.")
-    except KeyboardInterrupt:
-        abort_immediately()
-
-
 def paste_commands(command_path: Path, target_pane: str, tmux_binary: str = "tmux") -> None:
     """Use the same tmux executable for selection, export, and teleport commands."""
     subprocess.run([tmux_binary, "load-buffer", str(command_path), ";",
                     "paste-buffer", "-d", "-t", target_pane], check=True)
-
-
-def maybe_rescan_export(c: Cuboid, output_path: Path, player: str, target_pane: str,
-                        command_dir: Path, export_dir: Path, state: dict, state_path: Path,
-                        tmux_binary: str) -> None:
-    """Probe empty columns only during collection, with acknowledged loading."""
-    evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
-    columns = evidence.get("column_presence", {})
-    if not columns.get("unverified_columns", columns.get("missing_columns", 0)):
-        return
-    settings = state.get("rescan_settings", {})
-    logfile = Path(settings.get("server_log") or export_dir.parent / "Logs" / "server-main.log")
-    if not logfile.is_file():
-        print(f"Cannot verify chunk loading for deeper rescan: server log unavailable at {logfile}. Use --server-log.")
-        return
-    registry = state.setdefault("column_rescans", {"version": 1, "probes": {}, "sections": {}})
-    report_activity("Checking missing columns and retained rescan evidence", c)
-    console = capture_rescan.Console(tmux_binary, target_pane, logfile,
-                                    command_dir / "rescans", paste_commands, activity=report_activity)
-    try:
-        capture_rescan.rescan_export(
-            output_path, cuboid_record(c), prefix=state.get("signature", {}).get("prefix", c.name),
-            player=player, console=console, export_dir=export_dir, registry=registry,
-            save=lambda: save_state(state_path, state),
-            stable=lambda path: stable_file(path, lambda: False), archive=archive_invalid,
-            ymin=settings.get("ymin", 0))
-    except (OSError, ValueError, TimeoutError, RuntimeError) as exc:
-        # Leave the source intact and fall back to bounded recovery. A deeper
-        # export lacking records must never silently bless an unloaded chunk.
-        print(f"Deeper rescan unresolved: {exc}")
-        record = registry.setdefault("sections", {}).setdefault(c.name, {})
-        record.update(status="unresolved", problem=str(exc))
-        save_state(state_path, state)
-
-
-def run_export_attempt(c: Cuboid, player: str, target_pane: str, command_dir: Path,
-                       export_dir: Path, state: dict[str, Any], state_path: Path,
-                       confirm: bool = True, verbose: bool = True,
-                       tmux_binary: str = "tmux") -> tuple[str, list[str]]:
-    """Send one section export and return complete/incomplete/skipped plus problems."""
-    output_path = export_dir / f"{c.name}.json"
-    report_activity("Preparing export commands", c)
-    archive_invalid(output_path)
-    command_path = command_dir / f"{c.name}.txt"
-    command_text = (
-        f"/executeas {player} /we select {c.xmin} {c.ymin} {c.zmin} {c.xmax} {c.ymax} {c.zmax}\n"
-        f"/executeas {player} /we export {c.name}\n"
-    )
-    command_path.write_text(command_text, encoding="utf-8")
-    if confirm or verbose:
-        print(f"Command file ready for {region_label(c)}.")
-    if confirm:
-        report_activity("Waiting for export confirmation", c)
-        choice = input("Press Return to load and paste these commands; n to skip; q to quit: ").strip().lower()
-        if choice.startswith("q"):
-            raise KeyboardInterrupt
-        if choice in ("n", "no"):
-            return "skipped", []
-        if choice not in ("", "y", "yes"):
-            print("No action taken; press Return to send, n to skip, or q to quit.")
-            return "not-sent", []
-    paste_commands(command_path, target_pane, tmux_binary)
-    report_activity("Waiting for export file to appear and become stable", c)
-    if confirm or verbose:
-        print("Commands pasted. Waiting for the export file to appear.")
-    state["sections"][c.name] = {"status": "waiting", "file": str(output_path)}
-    save_state(state_path, state)
-    if confirm or verbose:
-        print(f"Waiting for a stable export for {region_label(c)}.")
-    if not stable_file(output_path, lambda: False):
-        raise KeyboardInterrupt
-    maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
-                        state, state_path, tmux_binary)
-    report_activity("Validating export", c)
-    problems = validate_export(output_path, c)
-    if problems:
-        state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
-        save_state(state_path, state)
-        if not confirm and not verbose:
-            print("incomplete: " + "; ".join(problems))
-        return "incomplete", problems
-    state["sections"][c.name] = {"status": "complete", "file": str(output_path),
-                                 "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
-    state["sections"][c.name].update(returned_bounds=evidence["covered"],
-                                     ceiling_blocks=evidence["ceiling_blocks"],
-                                     column_presence=evidence["column_presence"])
-    short_height = evidence["covered"] and evidence["covered"]["ymax"] < c.ymax
-    if not confirm and not verbose:
-        print("export validated" + (" (height trimmed)" if short_height else ""))
-    if evidence["ceiling_blocks"]:
-        print(f"\nHeight warning: {evidence['ceiling_blocks']} entries reach requested Y ceiling {c.ymax} in {c.name}.")
-    if short_height:
-        print(f"Stored height ends at Y {evidence['covered']['ymax']}; requested through {c.ymax}. "
-              "WorldEdit omits air; the final audit keeps this height difference unverified.")
-    save_state(state_path, state)
-    return "complete", []
-
-
-def teleport_player_to_cuboid(c: Cuboid, player: str, target_pane: str,
-                              command_dir: Path, verbose: bool = True,
-                              tmux_binary: str = "tmux") -> Path:
-    """Request creative mode and teleport using the same X/Z coordinates as `/we select`."""
-    report_activity("Teleporting player and waiting before retry", c)
-    x = (c.xmin + c.xmax) // 2
-    y = max(c.ymin, c.ymax - 2)
-    z = (c.zmin + c.zmax) // 2
-    command_path = command_dir / f"teleport_section{c.index:04d}_x{c.xmin}_{c.xmax}_z{c.zmin}_{c.zmax}.txt"
-    command_path.write_text(f"/gm {player} creative\n/tp {player} {x} {y} {z}\n", encoding="utf-8")
-    if verbose:
-        print(f"Teleport command file ready: {command_path}")
-    paste_commands(command_path, target_pane, tmux_binary)
-    if verbose:
-        print(f"Teleport sent ({x}, {y}, {z}).")
-    return command_path
-
-
-def recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
-                          command_dir: Path, export_dir: Path, state: dict[str, Any],
-                          state_path: Path, status_reporter: RunStatus,
-                          verbose: bool = False, tmux_binary: str = "tmux"
-                          ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
-    """Pause on Ctrl-C at the current region, retaining completed siblings."""
-    restart_pending = False
-    while True:
-        try:
-            return _recover_automatically(c, depth, player, target_pane, command_dir,
-                                          export_dir, state, state_path, status_reporter,
-                                          verbose, restart_pending, tmux_binary)
-        except KeyboardInterrupt:
-            pause_after_interrupt(state, state_path)
-            # A file received while paused is not a validated save. Send this
-            # selection again unless its validation was already checkpointed.
-            restart_pending = state["sections"].get(c.name, {}).get("status") != "complete"
-
-
-def _recover_automatically(c: Cuboid, depth: int, player: str, target_pane: str,
-                           command_dir: Path, export_dir: Path, state: dict[str, Any],
-                           state_path: Path, status_reporter: RunStatus,
-                           verbose: bool, restart_pending: bool, tmux_binary: str
-                           ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
-    """Attempt, teleport and retry, then split at most twice before asking."""
-    output_path = export_dir / f"{c.name}.json"
-    saved = state.get("sections", {}).get(c.name, {})
-    report_activity("Checking saved selection and recovery state", c)
-    if restart_pending and output_path.exists():
-        checkpoint = state.get("column_rescans", {}).get("sections", {}).get(c.name, {})
-        if checkpoint.get("sha256"):
-            current = capture_plan.inspect_export(output_path, cuboid_record(c))
-            if not current["problems"] and current.get("sha256") == checkpoint["sha256"]:
-                # A completed rescan checkpoint is usable even when the
-                # larger selection was interrupted before reaching complete.
-                restart_pending = False
-    if not restart_pending and output_path.exists() and not saved.get("segmented"):
-        maybe_rescan_export(c, output_path, player, target_pane, command_dir, export_dir,
-                            state, state_path, tmux_binary)
-    if not restart_pending and output_path.exists() and not validate_export(output_path, c):
-        state["sections"][c.name] = validated_export_record(c, output_path, saved)
-        save_state(state_path, state)
-        if verbose:
-            print(f"Already complete: {region_label(c)}")
-        status_reporter.maybe_report()
-        return [(c, output_path)], []
-
-    def process_children(children: list[dict[str, Any]],
-                         retained: list[dict[str, Any]]
-                         ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
-        leaves = [(cuboid_from_record(c, item, Path(item["file"]).stem), Path(item["file"]))
-                  for item in retained]
-        gaps: list[dict[str, int]] = []
-
-        def checkpoint(pending: list[dict[str, Any]]) -> None:
-            remaining = gaps + [cuboid_record(cuboid_from_record(c, item, item["name"]))
-                                for item in pending]
-            state["sections"][c.name] = {
-                "status": "partial" if remaining else "complete", "file": str(output_path),
-                "pieces": [str(path) for _, path in leaves], "gaps": remaining,
-                "piece_regions": [{"file": str(path), **cuboid_record(piece)} for piece, path in leaves],
-                "segmented": True, "children": children, "retained_regions": retained,
-            }
-            save_state(state_path, state)
-
-        # Persist the work queue before starting a child, and after each result.
-        checkpoint(children)
-        for index, item in enumerate(children):
-            child = cuboid_from_record(c, item, item["name"])
-            child_pieces, child_gaps = recover_automatically(
-                child, item["depth"], player, target_pane, command_dir, export_dir,
-                state, state_path, status_reporter, verbose, tmux_binary)
-            leaves.extend(child_pieces)
-            gaps.extend(child_gaps)
-            checkpoint(children[index + 1:])
-        return leaves, gaps
-
-    if saved.get("children"):
-        return process_children(saved["children"], saved.get("retained_regions", []))
-
-    if saved.get("gaps") and (saved.get("segmented") or saved.get("status") == "partial"):
-        retained: list[dict[str, Any]] = []
-        for item in saved.get("piece_regions", []):
-            piece = cuboid_from_record(c, item, Path(item["file"]).stem)
-            piece_path = Path(item["file"])
-            if piece_path.is_file() and not validate_export(piece_path, piece):
-                retained.append(item)
-        children = []
-        for index, bounds in enumerate(saved["gaps"], 1):
-            gap_name = (f"{c.name}_resume{index}_x{bounds['xmin']}_{bounds['xmax']}"
-                        f"_z{bounds['zmin']}_{bounds['zmax']}")
-            children.append({"name": gap_name, "depth": min(depth + 1, 2), **bounds})
-        return process_children(children, retained)
-
-    def attempt() -> tuple[str, list[str]]:
-        if verbose:
-            print(f"Selecting {region_label(c)} for export ...")
-        else:
-            print(f"selecting {c.size[0]}x{c.size[1]}x{c.size[2]} for export ... ", end="", flush=True)
-        result = run_export_attempt(c, player, target_pane, command_dir, export_dir,
-                                    state, state_path, confirm=False, verbose=verbose,
-                                    tmux_binary=tmux_binary)
-        if verbose:
-            label = "passed validation" if result[0] == "complete" else result[0]
-            print(f"Export {label} for {region_label(c)}.")
-            for problem in result[1]:
-                print(f"  - {problem}")
-        status_reporter.maybe_report()
-        return result
-
-    result, problems = attempt()
-    if result == "complete":
-        return [(c, output_path)], []
-
-    print("teleporting ... ", end="", flush=True)
-    teleport_player_to_cuboid(c, player, target_pane, command_dir, verbose=verbose,
-                              tmux_binary=tmux_binary)
-    print(f"waiting {AUTO_TELEPORT_DELAY}s ... ", end="", flush=True)
-    time.sleep(AUTO_TELEPORT_DELAY)
-    print("delay elapsed; retrying export")
-    status_reporter.maybe_report()
-    result, problems = attempt()
-    if result == "complete":
-        return [(c, output_path)], []
-
-    if depth < 2 and max(c.size) > 1:
-        print(f"splitting {c.size[0]}x{c.size[1]}x{c.size[2]} ...")
-        children = [{"name": child.name, "depth": depth + 1, **cuboid_record(child)}
-                    for child in split_largest_dimension(c, f"{c.name}_d{depth+1}")]
-        pieces, gaps = process_children(children, [])
-        if not gaps:
-            print(f"section {c.index} export files validated")
-        return pieces, gaps
-
-    if verbose:
-        print(f"Incomplete: {region_label(c)}")
-        for problem in problems:
-            print(f"  - {problem}")
-    while True:
-        choice = input("Quarter incomplete: [r]etry, [s]kip, [q]uit: ").strip().lower()
-        if choice == "r":
-            result, problems = attempt()
-            if result == "complete":
-                return [(c, output_path)], []
-            print("still incomplete")
-            continue
-        if choice == "s":
-            gap = [cuboid_record(c)]
-            state["sections"][c.name] = {"status": "partial", "gaps": gap, "pieces": []}
-            save_state(state_path, state)
-            return [], gap
-        if choice == "q":
-            raise UserQuit
-        print("Choose r, s, or q.")
-
-
-def recover_by_splitting(c: Cuboid, depth: int, player: str, target_pane: str,
-                         command_dir: Path, export_dir: Path, state: dict[str, Any],
-                         state_path: Path, split_immediately: bool = False,
-                         tmux_binary: str = "tmux"
-                         ) -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
-    """Retry or split a failed region; retain partial exports and report explicit gaps."""
-    output_path = export_dir / f"{c.name}.json"
-    if output_path.exists() and not validate_export(output_path, c):
-        print(f"Using the already validated export for {region_label(c)}; moving on.")
-        state["sections"][c.name] = {"status": "complete", "file": str(output_path),
-                                     "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        save_state(state_path, state)
-        return [(c, output_path)], []
-
-    def split_children() -> tuple[list[tuple[Cuboid, Path]], list[dict[str, int]]]:
-        leaves: list[tuple[Cuboid, Path]] = []
-        gaps: list[dict[str, int]] = []
-        for child in split_largest_dimension(c, f"{c.name}_d{depth+1}"):
-            child_leaves, child_gaps = recover_by_splitting(
-                child, depth + 1, player, target_pane, command_dir, export_dir, state, state_path,
-                tmux_binary=tmux_binary)
-            leaves.extend(child_leaves)
-            gaps.extend(child_gaps)
-        state["sections"][c.name] = {
-            "status": "partial" if gaps else "complete", "file": str(output_path),
-            "pieces": [str(path) for _, path in leaves], "gaps": gaps,
-            "piece_regions": [{"file": str(path), **cuboid_record(piece)} for piece, path in leaves],
-            "segmented": True,
-        }
-        save_state(state_path, state)
-        if not gaps:
-            if depth == 0:
-                print(f"All split portions of section {c.index} are complete; finalizing the section.")
-            else:
-                print(f"Both halves are complete for {region_label(c)}; moving up one split level.")
-        return leaves, gaps
-
-    saved = state["sections"].get(c.name, {})
-    if not split_immediately and saved.get("segmented"):
-        if saved.get("gaps"):
-            return split_children()
-        pieces = []
-        for item in saved.get("piece_regions", []):
-            piece = cuboid_from_record(c, item, Path(item["file"]).stem)
-            piece_path = Path(item["file"])
-            if piece_path.is_file() and not validate_export(piece_path, piece):
-                pieces.append((piece, piece_path))
-        if pieces:
-            if depth == 0:
-                print(f"Saved split pieces already cover section {c.index}; finalizing the section.")
-            else:
-                print(f"Saved halves already cover {region_label(c)}; moving up one split level.")
-            return pieces, []
-    if not split_immediately and saved.get("status") == "partial" and saved.get("gaps"):
-        leaves: list[tuple[Cuboid, Path]] = []
-        returned = saved.get("returned_bounds")
-        saved_file = Path(saved["file"]) if saved.get("file") else None
-        if returned is not None and saved_file is not None and saved_file.exists():
-            leaves.append((c, saved_file))
-        remaining: list[dict[str, int]] = []
-        prefix = state.get("signature", {}).get("prefix", "capture")
-        for bounds in saved["gaps"]:
-            gap_name = (f"{prefix}_{c.index:04d}_gap_x{bounds['xmin']}_{bounds['xmax']}"
-                        f"_y{bounds['ymin']}_{bounds['ymax']}_z{bounds['zmin']}_{bounds['zmax']}")
-            gap_cuboid = cuboid_from_record(c, bounds, gap_name)
-            gap_pieces, gap_remainder = recover_by_splitting(
-                gap_cuboid, depth, player, target_pane, command_dir, export_dir, state, state_path,
-                tmux_binary=tmux_binary)
-            leaves.extend(gap_pieces)
-            remaining.extend(gap_remainder)
-        state["sections"][c.name] = {
-            "status": "partial" if remaining else "complete", "file": str(saved_file) if saved_file else None,
-            "returned_bounds": returned, "pieces": [str(path) for _, path in leaves],
-            "gaps": remaining,
-        }
-        save_state(state_path, state)
-        return leaves, remaining
-
-    # The user selected segmentation for this already failed cuboid. Do not
-    # submit the same full-size cuboid again before splitting it.
-    if split_immediately:
-        if depth >= 3 or max(c.size) <= 1:
-            print("Cannot split this section further; the three-level split limit is reached.")
-            gap = [cuboid_record(c)]
-            state["sections"][c.name] = {"status": "partial", "gaps": gap, "pieces": []}
-            save_state(state_path, state)
-            return [], gap
-        return split_children()
-
-    retry_confirm = True
-    while True:
-        status, problems = run_export_attempt(c, player, target_pane, command_dir,
-                                              export_dir, state, state_path, retry_confirm,
-                                              tmux_binary=tmux_binary)
-        if status == "complete":
-            outcome = "Retry succeeded" if not retry_confirm else "Export passed validation"
-            print(f"{outcome} for {region_label(c)}; WorldEdit returned "
-                  f"{reported_export_size(output_path)}. Continuing to the next portion.")
-            return [(c, output_path)], []
-        if status == "skipped":
-            gap = [cuboid_record(c)]
-            state["sections"][c.name] = {"status": "partial", "gaps": gap, "pieces": []}
-            save_state(state_path, state)
-            return [], gap
-        if status == "not-sent":
-            continue
-        print(f"Export is incomplete for {region_label(c)}:")
-        for problem in problems:
-            print(f"  - {problem}")
-        can_split = depth < 3 and max(c.size) > 1
-        can_teleport = depth >= 2
-        if can_split and can_teleport:
-            prompt = "[r]etry now, [s]plit largest dimension, [k]keep returned part and skip remainder, [t]eleport and retry, [q]uit: "
-        elif can_split:
-            prompt = "[r]etry now, [s]plit largest dimension, [k]keep returned part and skip remainder, [q]uit: "
-        elif can_teleport:
-            prompt = "[r]etry now, [k]keep returned part and skip remainder, [t]eleport and retry, [q]uit (split limit reached): "
-        else:
-            prompt = "[r]etry now, [k]keep returned part and skip remainder, [q]uit (cannot split further): "
-        while True:
-            choice = input(prompt).strip().lower()
-            if choice == "r":
-                retry_confirm = False
-                break
-            if choice == "s" and can_split:
-                return split_children()
-            if choice == "k":
-                returned = returned_export_bounds(output_path, c) if output_path.exists() else None
-                gaps = uncovered_remainder(c, returned)
-                pieces = [(c, output_path)] if returned is not None else []
-                state["sections"][c.name] = {
-                    "status": "partial", "file": str(output_path) if output_path.exists() else None,
-                    "returned_bounds": returned, "pieces": [str(output_path)] if pieces else [],
-                    "gaps": gaps,
-                }
-                save_state(state_path, state)
-                return pieces, gaps
-            if choice == "t" and can_teleport:
-                teleport_player_to_cuboid(c, player, target_pane, command_dir,
-                                          tmux_binary=tmux_binary)
-                while True:
-                    ready = input("After the player arrives and the client has synchronized, press Return to issue the capture again; q to quit: ").strip().lower()
-                    if ready == "q":
-                        raise KeyboardInterrupt
-                    if ready == "":
-                        retry_confirm = False
-                        break
-                    print("Press Return to retry now, or q to quit.")
-                break
-            if choice == "q":
-                raise KeyboardInterrupt
-            print("No action taken; choose one of the listed options.")
-
-
-def finalize_split_result(c: Cuboid, pieces: list[tuple[Cuboid, Path]], gaps: list[dict[str, int]],
-                          export_dir: Path, state: dict[str, Any], state_path: Path) -> None:
-    output_path = export_dir / f"{c.name}.json"
-    state["sections"][c.name] = {
-        **state["sections"].get(c.name, {}),
-        "status": "partial" if gaps else "complete", "file": str(output_path),
-        "pieces": [str(path) for _, path in pieces], "gaps": gaps, "segmented": True,
-        "piece_regions": [{"file": str(path), **cuboid_record(piece)} for piece, path in pieces],
-    }
-    save_state(state_path, state)
-    if gaps:
-        print(f"Split capture kept {len(pieces)} export file(s) and recorded {len(gaps)} uncovered region(s).")
-        print("No combined export was written because the requested area still has gaps.")
-    elif pieces:
-        try:
-            archive_invalid(output_path)
-            merge_exports(c, pieces, output_path)
-            merge_problems = validate_export(output_path, c)
-            if merge_problems:
-                raise ValueError("Combined export did not validate: " + "; ".join(merge_problems))
-            state["sections"][c.name] = {
-                "status": "complete", "file": str(output_path), "merged": True,
-                "pieces": [str(path) for _, path in pieces], "gaps": [],
-                "segmented": True,
-                "piece_regions": [{"file": str(path), **cuboid_record(piece)} for piece, path in pieces],
-                "validated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")
-            }
-            save_state(state_path, state)
-            print(f"Section {c.index}: all {len(pieces)} split files and the combined export passed validation. "
-                  "The final audit determines 3D coverage.")
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            state["sections"][c.name] = {
-                **state["sections"].get(c.name, {}),
-                "status": "partial", "file": str(output_path),
-                "pieces": [str(path) for _, path in pieces], "gaps": [],
-                "problems": [f"Could not combine split exports: {exc}"]
-            }
-            save_state(state_path, state)
-            print(f"Section {c.index} has {len(pieces)} validated split files, "
-                  f"but the combined file could not be created: {exc}")
-    else:
-        print("No usable export pieces were returned; the full section is recorded as an uncovered region.")
 
 
 def prompt_value(label: str, default: str) -> str:
@@ -961,369 +165,183 @@ def print_status_help() -> None:
         print(f"Immediate status: kill -USR1 {os.getpid()} (this system has no Ctrl-T/SIGINFO).", flush=True)
 
 
-def revalidate_existing_exports(cuboids: list[Cuboid], state: dict, export_dir: Path,
-                                reporter: RunStatus, verbose: bool = False) -> tuple[int, int, int, int]:
-    """Check saved files with visible progress and one index scan per file."""
-    started = time.monotonic()
-    print(f"Startup: checking saved exports for {len(cuboids)} selections in {export_dir}. "
-          "Existing files are parsed and validated before reuse.", flush=True)
-    complete = accepted = incomplete = absent = 0
-    last_output = started
-    for index, c in enumerate(cuboids, 1):
-        reporter.set_activity(f"Startup validation {index}/{len(cuboids)}: {c.name}", c)
-        now = time.monotonic()
-        if verbose or index == 1 or index % 10 == 0 or index == len(cuboids) or now - last_output >= 5:
-            print(f"Startup check {index}/{len(cuboids)}: {c.name} "
-                  f"({now - started:.0f}s elapsed)", flush=True)
-            last_output = now
-        output_path = export_dir / f"{c.name}.json"
-        previous = state["sections"].get(c.name, {})
-        if output_path.exists():
-            evidence = capture_plan.inspect_export(output_path, cuboid_record(c))
-            problems = validate_export(output_path, c, evidence=evidence)
-            if not problems:
-                if previous.get("status") == "accepted":
-                    accepted += 1
-                else:
-                    complete += 1
-                    state["sections"][c.name] = validated_export_record(c, output_path, previous, evidence=evidence)
-            else:
-                incomplete += 1
-                if verbose:
-                    print("  Needs recovery: " + "; ".join(problems), flush=True)
-                if not (previous.get("segmented") or
-                        (previous.get("status") == "partial" and previous.get("gaps"))):
-                    state["sections"][c.name] = {"status": "incomplete", "file": str(output_path), "problems": problems}
-        elif previous.get("status") in ("complete", "accepted") and not previous.get("segmented"):
-            state["sections"].pop(c.name, None)
-            absent += 1
-        else:
-            absent += 1
-        reporter.maybe_report()
-    print(f"Startup check finished in {time.monotonic() - started:.1f}s: "
-          f"{complete} verified, {accepted} accepted, {incomplete} need recovery, {absent} pending.", flush=True)
-    return complete, accepted, incomplete, absent
-
-
-def refresh_collection_from_audit(plan: dict, report: dict, state: dict) -> None:
-    """Refresh root checkpoints from the files just audited, without rereading them."""
-    state["planned_sections"] = [item["name"] for item in plan["cuboids"]]
-    sections = state.setdefault("sections", {})
-    def key(name, bounds):
-        return name, tuple(bounds[k] for k in capture_plan.BOUND_KEYS)
-    evidence_by_key = {key(Path(item["file"]).stem, item["requested"]): item for item in report["files"]}
-    def usable(item):
-        columns = item.get("column_presence", {})
-        return (not item["problems"] and item.get("covered") is not None
-                and not columns.get("unverified_columns", columns.get("missing_columns", 0)))
-    def resolved(name, bounds, ancestors):
-        if name in ancestors:
-            return False
-        item = evidence_by_key.get(key(name, bounds))
-        if item is None:
-            return False
-        previous = sections.get(name, {})
-        if previous.get("status") == "accepted" and Path(item["file"]).is_file():
-            return True
-        if usable(item) and not item.get("pieces") and not previous.get("merged"):
-            return True
-        children = item.get("pieces", []) if item.get("covered") else []
-        if not children and previous.get("segmented"):
-            children = previous.get("piece_regions", []) + previous.get("children", [])
-        if not children:
-            return False
-        bounds_list = [capture_plan.box(child) for child in children]
-        if any(capture_plan.intersection(child, bounds) != child for child in bounds_list):
-            return False
-        if capture_plan.difference([bounds], bounds_list):
-            return False
-        return all(resolved(child.get("name") or Path(child["file"]).stem, child_bounds, ancestors | {name})
-                   for child, child_bounds in zip(children, bounds_list))
-    for task in plan["cuboids"]:
-        name, bounds = task["name"], capture_plan.box(task)
-        previous = sections.get(name, {})
-        item = evidence_by_key.get(key(name, bounds))
-        if resolved(name, bounds, set()):
-            if previous.get("status") == "accepted":
-                continue
-            if item and usable(item) and not item.get("pieces") and not previous.get("merged"):
-                c = Cuboid(task["index"], **bounds, name=name)
-                sections[name] = validated_export_record(c, Path(item["file"]), previous, evidence=item)
-            else:
-                sections[name] = {**previous, "status": "complete", "gaps": []}
-        elif previous.get("segmented"):
-            sections[name] = {**previous, "status": "partial"}
-        else:
-            columns = item.get("column_presence", {}) if item else {}
-            problems = list(item["problems"]) if item else ["No audited export evidence"]
-            if columns.get("unverified_columns", columns.get("missing_columns", 0)):
-                problems.append("Column coverage remains unverified")
-            sections[name] = {**previous, "status": "incomplete",
-                              "problems": problems, "column_presence": columns,
-                              "returned_bounds": item.get("covered") if item else None}
-    update_collection_completion(state)
-
-
-def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path,
-                     state_path: Path | None = None) -> int:
-    report_activity("Starting coverage audit", clear_region=True)
-    state["planned_sections"] = [item["name"] for item in plan["cuboids"]]
-    state.update(audit_status="running", coverage_complete=None, column_coverage_complete=None)
-    update_collection_completion(state)
-    if state_path:
-        save_state(state_path, state)
-    def progress(index, total, name):
-        report_activity(f"Auditing export {index}/{total}: {name}", clear_region=True)
-        capture_plan.audit_progress(index, total, name)
-    try:
-        report = capture_plan.audit_coverage(plan, state, export_dir, progress=progress)
-        refresh_collection_from_audit(plan, report, state)
-        report["collection_finished"] = state["finished"]
-        report["collection_completion"] = state["completion"]
-        report_activity("Writing coverage report and previews", clear_region=True)
-        path = plan_path.with_name(plan["prefix"] + "-audit.json")
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(report, indent=2) + "\n")
-        tmp.replace(path)
-        capture_plan.render_preview(plan, plan_path.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
-        capture_plan.render_column_preview(plan, report, plan_path.with_name(plan["prefix"] + "-columns.svg"))
-    except BaseException as exc:
-        state["audit_status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
-        if state_path:
-            try_save_state(state_path, state)
-        raise
-    state.update(audit_status="complete", coverage_complete=report["complete"],
-                 column_coverage_complete=report["column_presence"]["complete"])
-    if state_path:
-        save_state(state_path, state)
-    print(f"Collection finished: {state['finished']} "
-          f"({state['completion']['resolved_selections']}/{state['completion']['planned_selections']} selections resolved). "
-          f"Full requested 3D coverage verified: {state['coverage_complete']}.")
-    print(f"Verified reported 3D coverage: {report['coverage_percent']:.6f}% "
-          f"({report['verified_envelope_blocks']:,}/{report['requested_blocks']:,} positions).")
-    print(f"Exact uncovered regions: {len(report['gaps'])}. Audit: {path}")
-    columns = report["column_presence"]
-    print(f"Column evidence: {columns['observed_columns']:,}/{columns['requested_columns']:,}; "
-          f"{columns['missing_columns']:,} unverified; "
-          f"{columns['empty_columns_confirmed_by_rescan']:,} empty bands corroborated by deeper rescans.")
-    for warning in report["warnings"]:
-        print(f"Height/coverage warning: {warning}")
-    print(report["evidence_limits"])
-    return 0 if report["complete"] else 1
+def choose_compatible_run(runs,blocked,*,allow_new=True):
+    if len(runs)==1:
+        run=runs[0]
+        print(f"Continuing compatible run {run.state['run_id']} in {run.directory}",flush=True)
+        return run
+    if runs:
+        print('Multiple compatible runs match this plan. Choose which one to continue:',flush=True)
+        for index,run in enumerate(runs,1):
+            source=run.state['source']
+            status='finished' if run.state.get('finished') else 'unfinished'
+            print(f"  {index}: {run.directory} ({status}; player {source['player']}; exports {source['export_dir']})",flush=True)
+        while True:
+            choice=input('Run number, '+('n for a new run, ' if allow_new else '')+'or q to stop: ').strip().lower()
+            if choice=='n' and allow_new:
+                return None
+            if choice in ('','q'):
+                raise UserQuit
+            if choice.isdigit() and 1<=int(choice)<=len(runs):
+                return runs[int(choice)-1]
+            print('Choose a listed run number'+(', n' if allow_new else '')+', or q.',flush=True)
+    if blocked:
+        print('Prior runs were found, but compatibility could not be established:',flush=True)
+        for item in blocked:
+            print(f"  {item['directory']}: {item['problem']}",flush=True)
+        if not allow_new:
+            raise capture_run.CompatibilityError('No compatible run available for reporting')
+        while True:
+            choice=input('n to start a separate new run, or q to stop for review: ').strip().lower()
+            if choice=='n':
+                return None
+            if choice in ('','q'):
+                raise UserQuit
+            print('Choose n or q.',flush=True)
+    return None
 
 
 def _main(status_reporter: RunStatus) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN,
-                        help="saved coastline capture plan (default: capture-plans/coastal-connection/plan.json beside the script)")
-    parser.add_argument("--target-pane", help="tmux pane containing the server console")
-    parser.add_argument("--tmux-binary", type=Path,
-                        help="specific tmux executable; otherwise use tmux from PATH")
-    parser.add_argument("--preview", action="store_true",
-                        help="render the saved plan and exit without sending commands")
-    parser.add_argument("--export-dir", type=Path,
-                        help="directory containing WorldEdit JSON exports (otherwise prompted, or read from progress for a report)")
-    parser.add_argument("--report-coverage", action="store_true",
-                        help="revalidate exports and report exact X/Y/Z coverage without sending commands")
-    parser.add_argument("--verbose", action="store_true", help="print bounds and validation details")
-    parser.add_argument("--server-log", type=Path,
-                        help="server-main.log for acknowledged chunk loading during automatic deeper rescans (default: ../Logs/server-main.log relative to export directory)")
-    parser.add_argument("--rescan-y-min", type=int, default=0,
-                        help="lower Y for automatic 32x32 deeper probes of empty columns (default: 0; normal plan bounds stay unchanged)")
-    parser.add_argument("--step-by-step", action="store_true",
-                        help="confirm each export instead of using automatic recovery")
-    args = parser.parse_args()
-    if not args.preview and not args.report_coverage and not (args.target_pane or "").strip():
-        parser.error("--target-pane is required for collection")
-    args.plan = args.plan.expanduser().resolve()
+    parser=argparse.ArgumentParser(description="Collect isolated, fresh WorldEdit exports with coverage and seam checks.")
+    parser.add_argument('--plan',type=Path)
+    parser.add_argument('--run-dir',type=Path,help='run directory: create if new, continue if compatible')
+    parser.add_argument('--resume',type=Path,help='explicitly resume/audit an isolated run directory')
+    parser.add_argument('--new-run',action='store_true',help='start a fresh run instead of automatically continuing a compatible one')
+    parser.add_argument('--target-pane')
+    parser.add_argument('--tmux-binary',type=Path)
+    parser.add_argument('--export-dir',type=Path)
+    parser.add_argument('--server-log',type=Path)
+    parser.add_argument('--player')
+    parser.add_argument('--overlap',type=int,default=None,help='east/south overlap blocks (new runs: 3)')
+    parser.add_argument('--coverage-y',type=int,default=None,help='required coverage height (new runs: 109)')
+    parser.add_argument('--max-attempts',type=int,default=None,help='whole-section attempt limit (new runs: 3)')
+    parser.add_argument('--rescan-y-min',type=int,default=None)
+    parser.add_argument('--preview',action='store_true')
+    parser.add_argument('--prepare-only',action='store_true',help='create an isolated run and preview, then exit before sending commands')
+    parser.add_argument('--report-coverage',action='store_true')
+    parser.add_argument('--verbose',action='store_true')
+    parser.add_argument('--step-by-step',action='store_true')
+    args=parser.parse_args()
+    if args.resume and args.run_dir:
+        parser.error('--resume and --run-dir are mutually exclusive')
+    if sum((args.preview,args.prepare_only,args.report_coverage))>1:
+        parser.error('Choose only one of --preview, --prepare-only, or --report-coverage')
+    if args.new_run and (args.resume or args.report_coverage or args.preview):
+        parser.error('--new-run cannot be combined with --resume, --report-coverage, or --preview')
+    if args.new_run and args.run_dir and args.run_dir.expanduser().exists():
+        parser.error('--new-run requires a run directory that does not already exist')
+    if not args.preview and not args.report_coverage and not args.prepare_only and not (args.target_pane or '').strip():
+        parser.error('--target-pane is required for collection')
+    resuming=False
     try:
-        plan = capture_plan.load_plan(args.plan)
-        cuboids = [Cuboid(item["index"], **capture_plan.box(item), name=item["name"])
-                   for item in plan["cuboids"]]
-        status_reporter.configure(cuboids, {"sections": {}})
-        report_activity("Rendering plan preview", clear_region=True)
-        capture_plan.render_preview(plan, args.plan.with_suffix(".svg"))
-        if args.preview:
-            capture_plan.print_summary(plan, args.plan)
-            return 0
-        if args.report_coverage:
-            progress = args.plan.with_name(plan["prefix"] + "-progress.json")
-            state = capture_plan.read_json(progress) if progress.exists() else {}
-            status_reporter.configure(cuboids, state)
-            if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
-                raise ValueError("Progress belongs to a different capture plan")
-            export_path = args.export_dir or state.get("signature", {}).get("export_dir")
-            if not export_path:
-                parser.error("--export-dir is required until this plan has a saved run")
-            print_status_help()
-            export_path = Path(export_path).expanduser().resolve()
-            # A report may inspect a different directory, but must not replace
-            # the existing instance's saved execution checkpoint in that case.
-            saved_export = state.get("signature", {}).get("export_dir")
-            checkpoint = progress if progress.exists() and saved_export and Path(saved_export).expanduser().resolve() == export_path else None
-            audit_state = state if checkpoint else {}
-            return write_plan_audit(plan, args.plan, audit_state, export_path, state_path=checkpoint)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        parser.error(str(exc))
-
-    target_pane = args.target_pane.strip()
-    tmux_binary = str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else "tmux"
-    print("Vintage Story coastline export coordinator (terrain is never modified).")
-    print("Mode: " + ("step-by-step" if args.step_by_step else "automatic"))
-    player = prompt_value("Player name for /executeas", DEFAULT_PLAYER)
-    export_dir = args.export_dir or Path(prompt_value(
-        "WorldEdit export directory",
-        str(Path.home() / "Library" / "Application Support" / "VintagestoryData" / "WorldEdit"),
-    ))
-    export_dir = export_dir.expanduser().resolve()
-    if not export_dir.is_dir():
-        print(f"Export directory does not exist: {export_dir}. Enter the actual WorldEdit export directory.")
-        return 2
-
-    prefix = plan["prefix"]
-    bounds = {key: (min if key.endswith("min") else max)(b[key] for b in plan["requests"])
-              for key in capture_plan.BOUND_KEYS}
-    y_bounds = plan["requested_y"]
-    print(f"Saved coastline plan: {args.plan}\nFootprint and cuboid preview: {args.plan.with_suffix('.svg')}")
-    print(f"Geometry: {plan['geometry_version']} / {plan['geometry_hash']}")
-    print(f"Requested initial Y: {y_bounds['ymin']}..{y_bounds['ymax']}")
-    print(f"Initial horizontal caps: X {plan['partition'].get('x_span', capture_plan.MAX_SIDE)}, Z {plan['partition']['z_span']} blocks.")
-    run_dir = args.plan.parent
-    command_dir = run_dir / f"{prefix}-commands"
-    signature = {"capture_plan_hash": plan["plan_hash"], "geometry_hash": plan["geometry_hash"],
-                 "bounds": bounds, "export_dir": str(export_dir), "prefix": prefix}
-    state_path = run_dir / f"{prefix}-progress.json"
-    try:
-        state = load_state(state_path, signature)
-        state["planned_sections"] = [c.name for c in cuboids]
-        state.update(audit_status="not_run", coverage_complete=None, column_coverage_complete=None)
-        state["rescan_settings"] = {"ymin": args.rescan_y_min,
-            "server_log": str(args.server_log.expanduser().resolve()) if args.server_log else None}
-        command_dir.mkdir(parents=True, exist_ok=True)
-    except (OSError, ValueError, TypeError) as exc:
-        parser.error(str(exc))
-    print(f"Command files: {command_dir}")
-    status_reporter.configure(cuboids, state)
-    report_activity("Revalidating existing exports before collection", clear_region=True)
-    print_status_help()
-    complete_now, accepted_now, incomplete_now, absent_now = revalidate_existing_exports(
-        cuboids, state, export_dir, status_reporter, args.verbose)
-    save_state(state_path, state)
-    max_volume = max(c.size[0] * c.size[1] * c.size[2] for c in cuboids)
-    print(f"Capture plan: {len(cuboids)} nonoverlapping cuboids; largest selection {max_volume:,} blocks.")
-    print(f"Progress: {state_path}\nVerified {complete_now}; accepted {accepted_now}; incomplete {incomplete_now}; pending {absent_now}.")
-    if not args.step_by_step:
-        print("Ctrl-C pauses; r retries, q quits, a second Ctrl-C aborts.")
-
-    original_sigint_handler = signal.getsignal(signal.SIGINT)
-    try:
-        for c in cuboids:
-            report_activity("Checking next selection", c)
-            record = state["sections"].get(c.name, {})
-            output_path = export_dir / f"{c.name}.json"
-            if (record.get("status") in ("complete", "accepted") and output_path.exists()
-                    and not record.get("segmented")):
-                print(f"Section {c.index}/{len(cuboids)} already complete or accepted; moving on.")
-                continue
-            if output_path.exists() and not validate_export(output_path, c):
-                state["sections"][c.name] = validated_export_record(c, output_path, record)
-                save_state(state_path, state)
-                continue
-
-            if args.verbose or args.step_by_step:
-                print(f"\nSection {c.index}/{len(cuboids)}: {region_label(c)}")
-            else:
-                print(f"\nSection {c.index}/{len(cuboids)}")
-            if not args.step_by_step:
-                while True:
-                    try:
-                        pieces, gaps = recover_automatically(
-                            c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                            status_reporter, args.verbose, tmux_binary)
-                        record = state["sections"].get(c.name, {})
-                        if record.get("segmented") or gaps:
-                            finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
-                        break
-                    except KeyboardInterrupt:
-                        pause_after_interrupt(state, state_path)
-                status_reporter.maybe_report()
-                continue
-            if args.step_by_step and record.get("segmented") and record.get("gaps"):
-                print("Resuming the recorded split regions; the larger parent selection will not be retried.")
-                pieces, gaps = recover_by_splitting(
-                    c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                    split_immediately=True, tmux_binary=tmux_binary)
-                finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
-                continue
-            retry_confirm = True
-            while True:
-                status, problems = run_export_attempt(c, player, target_pane, command_dir,
-                                                      export_dir, state, state_path, retry_confirm,
-                                                      tmux_binary=tmux_binary)
-                if status == "not-sent":
-                    continue
-                if status == "skipped":
-                    gap = [cuboid_record(c)]
-                    state["sections"][c.name] = {"status": "partial", "pieces": [], "gaps": gap,
-                                                 "skip_reason": "user skipped before export"}
-                    save_state(state_path, state)
-                    break
-                if status == "complete":
-                    print(f"Section {c.index}: export file passed validation. The final audit checks 3D coverage.")
-                    break
-                print(f"Export is incomplete for {region_label(c)}:")
-                for problem in problems:
-                    print(f"  - {problem}")
-                while True:
-                    choice = input("[r]etry now, [b]reak/segment, [a]ccept, [s]kip, [q]uit: ").strip().lower()
-                    if choice in ("r", "b", "a", "s", "q"):
-                        break
-                    print("Enter r, b, a, s, or q. No action was taken.")
-                if choice == "r":
-                    retry_confirm = False
-                    continue
-                if choice == "a":
-                    returned = returned_export_bounds(output_path, c) if output_path.exists() else None
-                    state["sections"][c.name] = {"status": "accepted", "file": str(output_path),
-                                                 "problems": problems,
-                                                 "returned_bounds": returned,
-                                                 "gaps": uncovered_remainder(c, returned),
-                                                 "accepted_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                    save_state(state_path, state)
-                    break
-                if choice == "s":
-                    state["sections"][c.name] = {
-                        "status": "partial", "file": str(output_path), "pieces": [],
-                        "gaps": [cuboid_record(c)], "skip_reason": "user skipped section",
-                    }
-                    save_state(state_path, state)
-                    break
-                if choice == "q":
-                    raise KeyboardInterrupt
-
-                pieces, gaps = recover_by_splitting(
-                    c, 0, player, target_pane, command_dir, export_dir, state, state_path,
-                    split_immediately=True, tmux_binary=tmux_binary)
-                finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
-                break
-        result = write_plan_audit(plan, args.plan, state, export_dir, state_path=state_path)
-        return result
-    except (KeyboardInterrupt, EOFError, UserQuit):
-        signal.signal(signal.SIGINT, abort_immediately)
-        if try_save_state(state_path, state):
-            print(f"\nStopped. Progress saved to {state_path}; rerun to resume.")
+        explicit=args.resume or (args.run_dir if args.run_dir and args.run_dir.expanduser().exists() else None)
+        if explicit:
+            run=capture_run.Run.resume(explicit,export_dir=args.export_dir,server_log=args.server_log,player=args.player)
+            resuming=True
+            if args.plan and capture_plan.load_plan(args.plan.expanduser().resolve())['plan_hash']!=run.plan['plan_hash']:
+                parser.error('Supplied plan differs from the frozen run plan')
         else:
-            print("\nStopped. Rerun to resume from the last completed save.")
+            plan_path=(args.plan or DEFAULT_PLAN).expanduser().resolve()
+            plan=capture_plan.load_plan(plan_path)
+            if args.preview:
+                if args.run_dir:
+                    parser.error('Use --prepare-only to create a run and preview')
+                report_activity('Rendering plan preview',clear_region=True)
+                capture_plan.render_preview(plan,plan_path.with_suffix('.svg'))
+                capture_plan.print_summary(plan,plan_path)
+                return 0
+            run=None
+            if not args.run_dir and not args.new_run:
+                candidates,blocked=capture_run.discover_runs(plan,plan_path,export_dir=args.export_dir,
+                    server_log=args.server_log,player=args.player,
+                    settings={'overlap':args.overlap,'coverage_y':args.coverage_y,'probe_ymin':args.rescan_y_min})
+                run=choose_compatible_run(candidates,blocked,allow_new=not args.report_coverage)
+                resuming=run is not None
+            if run is None and args.report_coverage:
+                parser.error('No compatible capture run found; --report-coverage requires an existing run manifest')
+            if run is None:
+                player=args.player or prompt_value('Player name for /executeas',DEFAULT_PLAYER)
+                export_dir=(args.export_dir or Path(prompt_value('WorldEdit export directory',str(Path.home()/'WorldEdit')))).expanduser().resolve()
+                server_log=(args.server_log or export_dir.parent/'Logs'/'server-main.log').expanduser().resolve()
+                if not export_dir.is_dir() or not server_log.is_file():
+                    parser.error('Collection requires the actual server WorldEdit directory and readable --server-log')
+                run=capture_run.Run.create(plan,plan_path,export_dir,server_log,player,
+                    directory=args.run_dir.expanduser().resolve() if args.run_dir else None,
+                    overlap=3 if args.overlap is None else args.overlap,
+                    coverage_y=109 if args.coverage_y is None else args.coverage_y,
+                    max_attempts=3 if args.max_attempts is None else args.max_attempts,
+                    probe_ymin=0 if args.rescan_y_min is None else args.rescan_y_min)
+        if resuming:
+            for key,value in (('overlap',args.overlap),('coverage_y',args.coverage_y),('probe_ymin',args.rescan_y_min)):
+                if value is not None and value!=run.state['settings'][key]:
+                    parser.error('Capture settings differ; use --new-run and a new directory to change '+key)
+            if args.max_attempts is not None and args.max_attempts < run.state['attempt_limit']:
+                parser.error('Resume may explicitly raise, but not lower, the retry budget')
+        capture_run.register_run(run)
+    except (KeyboardInterrupt,EOFError,UserQuit):
+        print('No run started; prior outputs are unchanged.',flush=True)
         return 130
-    except (OSError, ValueError) as exc:
-        signal.signal(signal.SIGINT, abort_immediately)
-        saved = try_save_state(state_path, state)
-        print(f"Error: {exc}", file=sys.stderr)
-        if saved:
-            print(f"Progress saved to {state_path}.", file=sys.stderr)
-        return 2
-    finally:
-        signal.signal(signal.SIGINT, original_sigint_handler)
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        parser.error(str(exc))
+    status_reporter.configure([Cuboid(unit['index'],**unit['core'],name=unit['id']) for unit in run.state['units']],run.state)
+    def activity(description,unit=None):
+        report_activity(description,Cuboid(unit['index'],**unit['capture'],name=unit['id']) if unit else None)
+    run.activity=activity
+    run.verbose=args.verbose
+    print(f"Operational model: {run.state['operational_model']} ({capture_run.SCHEMA})",flush=True)
+    print(f"Export prefix: {run.state['prefix']}",flush=True)
+    print(f"Run ID: {run.state['run_id']}\nPlan SHA256: {run.plan['plan_hash']}\nRun directory: {run.directory}\nProgress: {run.path}",flush=True)
+    print(f"Preview: {run.directory/(run.state['run_id']+'-preview.svg')}\n"
+          f"{len(run.units)} raw selections; {run.state['settings']['overlap']}-block overlaps; "
+          f"required coverage through Y={run.state['settings']['coverage_y']}.",flush=True)
+    print_status_help()
+    if args.preview or args.prepare_only:
+        run.preview()
+        return 0
+    if not args.report_coverage:
+        if not Path(run.state['source']['server_log']).is_file() or not run.export_dir.is_dir():
+            parser.error('Saved run server log/export directory is unavailable')
+        binary=str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else 'tmux'
+        run.console=server_console.Console(binary,args.target_pane,Path(run.state['source']['server_log']),
+            run.directory/'commands',paste_commands,activity=lambda description:activity(description))
+    original_handler=signal.getsignal(signal.SIGINT)
+    try:
+        with run.locked():
+            if resuming and args.max_attempts is not None:
+                if args.max_attempts < run.state['attempt_limit']:
+                    raise capture_run.CaptureError('Retry budget advanced while opening the run; refusing to lower it')
+                run.state['attempt_limit']=args.max_attempts
+                run.save()
+            while True:
+                try:
+                    if args.report_coverage:
+                        return 0 if run.audit()['finished'] else 1
+                    return run.collect(confirm=args.step_by_step)
+                except KeyboardInterrupt:
+                    signal.signal(signal.SIGINT,abort_immediately)
+                    run.state.update(finished=False,audit_status='interrupted')
+                    run.save()
+                    print('\nPaused; run checkpoint saved. Ctrl-C again aborts.',flush=True)
+                    try:
+                        choice=input('[r]etry unfinished work, [q]uit: ').strip().lower()
+                    except (KeyboardInterrupt,EOFError):
+                        choice='q'
+                    if choice=='r':
+                        signal.signal(signal.SIGINT,original_handler)
+                        continue
+                    print(f'Stopped. Restart with the same plan to continue, or use --resume {run.directory}',flush=True)
+                    signal.signal(signal.SIGINT,original_handler)
+                    return 130
+                except (OSError,ValueError,KeyError,TypeError) as exc:
+                    run.state.update(finished=False,audit_status='failed',last_error=str(exc))
+                    run.save()
+                    print(f'Run incomplete: {exc}\nProgress: {run.path}',file=sys.stderr,flush=True)
+                    return 1
+                finally:
+                    signal.signal(signal.SIGINT,original_handler)
+    except capture_run.CaptureError as exc:
+        print(str(exc),file=sys.stderr,flush=True)
+        return 1
 
 
 def main() -> int:

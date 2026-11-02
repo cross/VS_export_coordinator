@@ -3,14 +3,13 @@
 The coordinator uses only a saved coastline capture plan. By default it loads
 `capture-plans/coastal-connection/plan.json` relative to the script, regardless
 of the current working directory. `--plan` selects a different saved plan.
-There is no centerline/corridor fallback or separate Y/Z prompt. The previous
-implementation remains available in Git history; its capture files are untouched.
+There is no centerline/corridor fallback or separate Y/Z prompt.
 The v12 geometry is a local copy of the accepted
 [`coastline_route_v12.py`](../capture-plans/coastal-connection/coastline_route_v12.py),
 stored with the plan it defines. This is planning input, rather than a
 temporary utility program.
 Planning and auditing use only the Python standard library and issue no server
-commands. Execute a capture only with the coordinator's `--plan` option.
+commands. The coordinator executes captures from saved plans.
 
 `plan.json` is generated output, rather than a file users need to author by
 hand. The generator is [`v12_capture_plan.py`](../v12_capture_plan.py). Its
@@ -20,6 +19,189 @@ requested regions, export cuboids, names, embedded geometry, and hashes needed
 for repeatable collection and coverage auditing.
 
 For instructions, see [Generate or revise a plan](#generate-or-revise-a-plan).
+
+## Isolated captures and compatible resume
+
+**New collections use operational model `fresh-loaded-whole-section-with-overlaps/1`
+and run schema `coast-capture-run/3`.** Each run freezes the plan and capture
+settings, records unique raw export attempts, and verifies loading, column
+coverage, and agreement between overlapping selections. Only current-format
+run manifests can be resumed or audited.
+
+Start the first run using a directory that does not yet exist:
+
+```sh
+python3 -B /path/to/vintage_story_export_coordinator.py \
+  --plan /path/to/capture-plans/coastal-connection/plan.json \
+  --run-dir "$HOME/vs-capture/coastal-connection-clean" \
+  --target-pane PANE \
+  --export-dir /path/to/server/data/WorldEdit \
+  --server-log /path/to/server/data/Logs/server-main.log
+```
+
+Repeat that command to continue after an interruption. You can also omit
+`--run-dir` on restart: the coordinator remembers custom run directories and
+automatically continues the one compatible run matching the plan and supplied
+server/player/settings. Repeating an existing `--run-dir` continues that run
+after compatibility checks. A completed run remains reusable too.
+
+Add `--prepare-only` to create the run, freeze its plan, and render its capture
+preview without sending commands. After reviewing the preview, repeat the
+command without `--prepare-only`, or explicitly select the prepared run below.
+If no prior run matches and `--run-dir` is omitted, a new writable directory is
+created under `./capture-runs/RUN_ID`. The installed program and source plan
+need not be writable. `-B` suppresses Python bytecode-cache writes.
+
+```sh
+python3 -B /path/to/vintage_story_export_coordinator.py \
+  --resume "$HOME/vs-capture/coastal-connection-clean" --target-pane PANE
+
+python3 -B /path/to/vintage_story_export_coordinator.py \
+  --resume "$HOME/vs-capture/coastal-connection-clean" --report-coverage
+```
+
+The run retains the player, actual export directory, and server-log path.
+`--tmux-binary /path/to/tmux` can be supplied on either collection command.
+Use `--verbose` for per-selection resume checks and `--step-by-step` to confirm
+primary captures. A report needs no pane and sends no commands. `--plan PLAN
+--report-coverage` also discovers and audits a compatible run automatically.
+If none is found, reporting stops with an error; loose export files are never
+adopted by filename. Plan-only `--preview` renders the planned cores; use
+`--prepare-only` or `--resume RUN_DIRECTORY --preview` for an isolated run's
+padded mosaic.
+
+Use `--new-run` to deliberately start a separate capture of the same plan.
+It bypasses automatic continuation and requires a new directory if `--run-dir`
+is supplied. Prior runs and their exports remain untouched. If several runs
+match, the coordinator asks which to continue rather than guessing. Supplying
+`--export-dir`, `--server-log`, or `--player` narrows the search. If a matching
+run is incompatible or unreadable and no compatible run exists, the coordinator
+shows the problem and asks whether to stop for review or create a separate run.
+Reporting stops on incompatibility because it cannot create a new run.
+
+Run locations are indexed in
+`$XDG_STATE_HOME/vintage-story-export-coordinator/runs.json`, defaulting to
+`~/.local/state/vintage-story-export-coordinator/runs.json`. Set
+`VS_CAPTURE_RUN_INDEX` to choose another index file, for example in a writable
+working directory. The index stores locations and identity metadata; each run
+manifest remains authoritative. Discovery also checks manifests in the current
+directory, beside the plan, and their immediate child/run directories. For a
+current-format run elsewhere that is not indexed, use `--resume DIRECTORY`
+once to register it.
+
+Each run gets a UTC timestamp plus random ID. Its `run.json`, frozen `plan.json`,
+`RUN_ID-progress.json`, `RUN_ID-preview.svg`, `RUN_ID-audit.json`, and `commands/`
+are kept together. The plan/geometry hashes are recorded separately from the
+run ID. Export names include that ID, selection ID, purpose, and a new random
+attempt token. `--export-dir` must identify where the server actually writes
+WorldEdit exports; the flag does not redirect the server's own output.
+
+For downstream analysis, `sections[UNIT_ID].selected.file` in the progress
+manifest is the authoritative primary file for that selection. Join it to
+`units[].core` and `units[].capture` by unit ID. Crop primary records to the
+nonoverlapping core when assembling a datamap; the raw file also contains its
+intentional overlap strips. Deep probes remain supplemental evidence. Never
+glob all JSONs or combine superseded attempts as if they were additional
+terrain: the manifest deliberately retains failed and replaced files too.
+An interrupted, not-yet-certified primary appears under `candidate` until its
+column confirmations finish. Reports retain that pending candidate's file
+references but do not credit the whole selection prematurely.
+
+Compatible full or partial runs are reusable automatically or through explicit
+`--resume`.
+Each run permits only one controller/report writer at a time via an advisory
+lock; do not run multiple controllers against the same server/player either.
+Only files selected by that run's manifest are eligible. Resume verifies the
+frozen plan, operational model, immutable source/settings, exact bounds,
+timestamps, file hashes, loading evidence, and deeper confirmations. An
+unrelated same-sized export is never discovered and adopted automatically.
+Finished data stays reusable. A section interrupted during deeper confirmation
+can continue its immutable primary candidate and already verified probes from
+that same attempt. Each completed probe is checkpointed. A contradictory or
+invalid attempt is rejected as a whole and its replacement gets a new primary
+filename; the rejected files remain as provenance. There is no need to empty
+the server's WorldEdit directory or remove unrelated exports.
+
+Changing status wording or diagnostics does not inherently change the model.
+Changes to loading, freshness, replacement, coverage, or comparison semantics
+must change the operational-model identifier. An old/unknown model or a changed
+`GameVersion` stops for compatibility review rather than silently reusing or
+deleting data. Continuation assumes the same saved-world baseline; if a different
+save is loaded at the same filesystem path, use `--new-run`. The controller
+cannot infer that world-baseline change from filenames alone.
+
+The default whole-section retry budget is three attempts. Explicitly raising
+it with `--max-attempts N` on resume preserves compatible evidence; changing
+the retry budget does not relax the validation rules. Changes to `--overlap`,
+`--coverage-y`, or `--rescan-y-min` require a new run definition.
+
+### Loading, fresh files, and whole-section replacement
+
+Every export, including the first section and every probe, requests force-load
+for its X/Z area, teleports the player, and checks both player-based chunk
+queues before selecting and exporting. The local server log is required for
+command acknowledgements. Failed loading or exports cannot be accepted merely
+because a nonzero block count was logged.
+
+Each command requires a previously absent output name. Existing names are
+refused, never overwritten or archived automatically. The new file must be a
+regular file with modification/change timestamps after command issuance and
+must stop changing. The run records the exact command time, timestamps, size,
+SHA256, and load responses. Clock/filesystem timestamp inconsistencies fail
+the attempt rather than weakening freshness checks.
+
+The primary export must account for every captured X/Z column through Y=109
+by default (`--coverage-y` changes this for a new run). It checks a record at
+the required height and record presence in every intersecting 32-block
+vertical stratum below it. Missing evidence triggers targeted 32-by-32 probes
+from Y=0 through the selection ceiling. A probe must contain records in every
+column; for each affected column, its entire in-band block/decor multiset must
+match the primary export. This corroborates genuine shafts/empty intervals
+without inserting artificial air records.
+
+If a probe instead recovers different records, the **entire primary selection**
+is retried under a new name. Present records from its older attempt are not
+retained. The chosen main export is always one untouched raw WorldEdit file;
+there are no synthesized, column-stitched section files. All superseded
+attempts and their hashes remain in the run history. Probes are bound to the
+same section attempt and are not borrowed from a different run or attempt.
+
+### Overlap checks and completion gates
+
+Plan cores stay nonoverlapping. Raw selections extend three blocks east and
+south by default, producing shared three-row/column strips and corner overlaps.
+All intersecting selections are compared, including side-by-side X pieces.
+The planner subdivides cores first if padding would violate the 1023 X/Z/Y
+packed-index limits or the selection-volume cap. The current 160-unit plan
+still uses 160 selections, with at most 453 X by 116 Y by 53 Z blocks each.
+
+For every shared position, comparison uses **block-code multisets**, preserving
+duplicate solid/fluid entries rather than comparing palette IDs or collapsing
+indices. Decor comparisons include block codes and face/subposition. The
+[official schematic format](https://github.com/anegostudios/vsapi/blob/master/Common/Collectible/Block/BlockSchematic.cs)
+stores decor block IDs in the low 24 bits. Entities/block-entity payloads are
+retained in raw files but are not part of the terrain seam comparison.
+
+A mismatch blocks completion and requests a fresh whole export of an affected
+section. Neighbor checks are repeated against its replacement. Persistent
+differences stop at the retry limit with `finished: false`. The final audit
+rechecks the selected files and probes and recomputes overlap fingerprints.
+It records every overlap's bounds, source filenames/hashes, and comparison
+digests; mismatches include differing-position counts and sample multisets.
+Exact requested coverage gaps are listed separately.
+
+In schema 3, `collection_finished` means all selections have validated raw
+captures; **`finished` requires required-height coverage, all overlap checks,
+all exact file hashes, and a completed final audit**. `coverage_complete` and
+`column_coverage_complete` describe that required-height evidence.
+`full_3d_coverage_complete` and `full_3d_gaps` retain the conservative result for
+the entire original Y range, including unverified omitted upper air. Thus a
+certified run can finish while formal height gaps above the required surface
+remain. Requested upper-ceiling block/decor hits remain visible as height warnings;
+review those before deciding that the chosen Y maximum is sufficient.
+Evidence is still conditional on the exporter returning loaded contents;
+overlap agreement is not proof of a simultaneous snapshot or of unchanged
+interiors between export times.
 
 ## Prepared plans: Y=65–180
 
@@ -42,39 +224,52 @@ generated `plan.svg` preview and a local PNG rendition. These previews are
 ignored by Git; the SVG can be regenerated with `--preview`. Broader bands reduce command and
 file-wait overhead by including edge terrain outside the exact footprint. Its
 cuboids remain nonoverlapping and its audit uses the exact requested footprint.
-Neither plan has been run against a server. No freshwater body definitions
+No freshwater body definitions
 have been supplied, so these prepared plans include no whole-lake supplements.
 
 ## Preview, run, resume, and audit
 
-Run these commands from this repository. Replace `PLAN.json`, `PANE`, and
-`EXPORT_DIRECTORY` with the chosen plan path, server console tmux pane, and
-directory containing the WorldEdit JSON exports.
+Use absolute paths when running from another directory. Relative command-line
+paths resolve from cwd; the default plan resolves beside the installed script.
 
 ```sh
-python3 vintage_story_export_coordinator.py --plan PLAN.json --preview
-python3 vintage_story_export_coordinator.py --plan PLAN.json --target-pane PANE --export-dir EXPORT_DIRECTORY
-python3 vintage_story_export_coordinator.py --plan PLAN.json --report-coverage --export-dir EXPORT_DIRECTORY
+python3 -B /path/to/vintage_story_export_coordinator.py --plan PLAN.json --preview
+python3 -B /path/to/vintage_story_export_coordinator.py --plan PLAN.json \
+  --target-pane PANE --export-dir EXPORT_DIRECTORY --server-log SERVER_LOG
+python3 -B /path/to/vintage_story_export_coordinator.py --plan PLAN.json --report-coverage
 ```
 
-The execution command still prompts for the player name. Repeat it to resume.
-The plan fixes geometry, unit names, and requested Y bounds; it does not prompt
-for a different capture prefix or Y interval. Changing the tmux pane/player
-does not invalidate geometric progress. Changing the export directory for an
-existing progress record is rejected instead of overwriting that record.
+The execution command prompts for the player name when creating the run.
+Repeat it to continue compatible work. The saved run retains the player,
+export directory, server log, and settings. Changing those inputs requires a
+separate run; changing the tmux pane is permitted. Reports need a matching run
+manifest and send no server commands. `--resume RUN_DIRECTORY` explicitly
+selects a run for collection, preview, or audit.
 
-Before collection, startup revalidates the saved export files to decide what
-can be reused. This parses their JSON, checks packed block/decor indices and
-column presence, and verifies retained rescan evidence and hashes. A large
-existing run can make this CPU-intensive; no server commands are sent during
-this pass. Successful validation evidence is reused when updating progress,
-so the block indices are scanned once per parent export during startup.
+The startup banner identifies the run, progress file, and preview. Before
+reusing a selected export, collection revalidates its exact file hash, bounds,
+loading evidence, column coverage, and deeper confirmations. It announces this
+work before reading the files and reports selection progress periodically
+(every selection with `--verbose`). Large exports can take time to parse; the
+status signal identifies the file being checked.
 
-The coordinator announces the startup check before reading exports, displays
-the selection number and elapsed time periodically (every selection with
-`--verbose`), and prints a completion summary. The PID/status-signal instructions
-appear before this pass. A status request identifies the exact startup file
-being checked, even between ordinary progress messages.
+The collector has no `--prefix` or `--z-span` option. Change geometry, height,
+and section sizes with `v12_capture_plan.py`, review the resulting plan, then
+start a new capture run. Missing or invalid plans stop execution.
+
+`tmux` is found in `PATH`, or selected with `--tmux-binary /absolute/path/to/tmux`.
+The chosen executable is used for every command, including loading and probes.
+A writable run directory, export directory, server log, and run index are
+needed; the installed script and source plan need not be writable. Use `-B`
+to avoid bytecode-cache writes beside installed Python modules.
+
+Reports write `RUN_ID-audit.json` inside the run directory. The report contains
+all core/capture bounds, selected primary/probe filenames and hashes, exact
+required-height and full-height gaps, overlap checks, file errors, and ceiling
+warnings. The progress checkpoint retains pending candidates and superseded
+attempts. See `sections[UNIT_ID].status`, `selected`, `candidate`, and `error`
+for each selection's current state. Exit codes are 0 for a certified complete
+run, 1 for an incomplete run, 2 for invalid inputs, and 130 for an interruption.
 
 ### Immediate status: Ctrl-T and signals
 
@@ -89,116 +284,13 @@ Linux method. The coordinator prints its PID and the status command at startup.
 `SIGUSR1` also works on macOS/BSD, and `kill -INFO PID` works where `SIGINFO`
 is available. See the [terminal status-character documentation](https://man7.org/linux/man-pages/man3/termios.3.html).
 
-The report includes finished/verified/accepted selection counts, partial and
-pending counts, elapsed time, current operation and its duration, selection
-bounds, and the last available rescan checkpoint. Export waits, server-command
-acknowledgements, recovery exports, and coverage audits identify their current
-operation. Status is printed to stderr without pausing or restarting work,
-sending commands, writing checkpoints, or performing a fresh coverage audit.
-The counts describe execution progress rather than a new proof of coverage.
-Ctrl-C retains its existing pause/quit behavior.
-
-The collector has no `--prefix` or `--z-span` option. Make geometry, height,
-and section-size changes with `v12_capture_plan.py`, review the resulting plan,
-then run the collector against that saved specification. A missing or invalid
-plan stops collection instead of selecting a different region generator.
-
-By default, both export commands and teleport commands use `tmux` from `PATH`.
-Use `--tmux-binary /absolute/path/to/tmux` to override it. The chosen executable
-is retained through retries and subdivisions.
-
-Each plan uses its own hash-derived prefix, `<prefix>-progress.json`, command
-directory, and execution coverage checkpoint beside `plan.json`. Reports write
-`<prefix>-audit.json`, `<prefix>-coverage.svg`, and `<prefix>-columns.svg`.
-The columns preview highlights only X/Z columns still unverified, while the
-coverage preview also includes vertical gaps. The audit JSON lists every
-exact uncovered cuboid, per-file validation problems and SHA256 values, and
-ceiling warnings. It re-reads the exports instead of trusting a saved complete
-status or the current coastline source. Exit codes: 0 means the requested 3D
-union is covered by validated reported envelopes, 1 means gaps remain, and 2
-means an input/error condition.
-
-### Collection completion and audit completion
-
-The progress file and execution coverage manifest distinguish these fields:
-
-| Field | Meaning |
-| --- | --- |
-| `finished` | Every planned root selection is complete or manually accepted. Skipped selections and unresolved recovery regions keep this false. |
-| `coverage_complete` | The latest completed audit verifies the entire requested 3D volume. `null` means the current audit has not produced a final result. |
-| `column_coverage_complete` | The latest completed audit accounts for every requested X/Z column through records or corroborating deeper evidence. Also `null` before a final audit result. |
-| `audit_status` | `not_run`, `running`, `complete`, `interrupted`, or `failed`; `complete` means the audit ran to completion, even if coverage gaps remain. |
-
-`finished` is recomputed on every checkpoint and becomes true as soon as all
-planned selections are resolved, before the final audit. Counts use only the
-plan's root selections, so old recovery children cannot inflate completion.
-The `completion` object records these counts and unresolved selection names.
-Manual acceptance resolves an execution item without proving its coverage.
-
-The final audit refreshes root statuses from the exports and source pieces it
-actually checked, writes current completion fields to the checkpoint and
-execution manifest, then prints its final summary. A coordinator
-`--report-coverage` for the saved instance also refreshes that checkpoint;
-reporting against a different export directory leaves the saved instance's
-checkpoint untouched. Export files remain unchanged by reporting.
-
-This is completion schema version 2 (`completion.version`). Previously,
-`finished` mirrored full 3D audit success. Thus an otherwise completed capture
-could have `finished: false` because omitted upper air remained unverified.
-Now that case has `finished: true`, `coverage_complete: false`, and usually
-`column_coverage_complete: true`. The audit JSON retains `complete` for full
-3D coverage and adds `collection_finished` and `collection_completion` for
-execution completion. Exit codes still follow the 3D audit result, so a
-finished collection can return 1 while conservative height gaps remain.
-
-Starting collection or an audit clears the current coverage-result fields to
-`null`. Interruption/failure never turns an old audit success into a new one;
-collection checkpoints remain available independently of the audit outcome.
-
-The saved plan embeds shoreline geometry, requested regions, export units,
-geometry version/hash, source-file hash, coordinate convention, and selection
-limits. A full content hash detects edits. Create a new plan to change bounds,
-geometry, partitioning, or supplements. The generator refuses to overwrite a
-different existing plan; generate a draft with `--output` before promoting it
-to the current Git-versioned plan.
-
-## Interpreting export failures and height messages
-
-WorldEdit's sparse block list can contain two entries at the same packed
-coordinate: one solid-layer block and one fluid-layer block. For example, a
-seaweed block and salt water can share a position. The
-[official schematic packing code](https://github.com/anegostudios/vsapi/blob/master/Common/Collectible/Block/BlockSchematic.cs)
-deliberately writes both entries. A validator error saying only
-`Duplicate block indices` was a coordinator bug, not evidence that teleporting
-failed to load that section.
-
-The validator now accepts two distinct block IDs at one coordinate, preserves
-both, and rejects repeated identical records or more than two block records
-at a coordinate. It validates the export format, not the game rules governing
-which specific solid/fluid combinations should occur. The JSON palette gives
-block codes but does not provide all block classes, placement rules, or mod
-behavior. No hardcoded plant/water compatibility list is used. Different fresh,
-salt, still, and flowing water codes are retained; the collector does not
-simulate their behavior or substitute one type for another. Merges retain
-both block-layer records.
-
-After updating from the version with the duplicate-index bug, restart with
-the same plan and export directory. Existing exports are revalidated. A usable
-direct parent export can supersede its earlier failed-split checkpoint;
-there is no need to delete the progress file or discard valid export data.
-
-`export validated (height trimmed)` means the JSON passed the file checks but
-its stored height is shorter than the requested height. WorldEdit omits air
-and computes dimensions from stored blocks, so this alone does not indicate
-a failed export. The final 3D audit conservatively leaves the omitted upper
-height unverified. A valid file and proven coverage of the entire requested
-height are different results.
-
-Teleport recovery currently waits a fixed 1.5 seconds before retrying. That
-delay is not an acknowledgement from the server that every required chunk is
-loaded. An initial empty export may still require chunk loading, while a
-format-validation error should be diagnosed from its printed reason. Reasons
-are now printed in normal automatic output as well as verbose output.
+The status report includes captured/verified selection counts, incomplete,
+waiting and pending counts, elapsed time, current operation and its duration,
+selection bounds, and saved deeper confirmations for the current attempt. It
+also shows the final coverage/overlap/audit gates separately from captured
+selection counts. Status is printed to stderr without pausing collection,
+sending commands, writing checkpoints, or starting a fresh audit.
+Ctrl-C saves a checkpoint and offers retry or quit; a second Ctrl-C aborts.
 
 ## Geometry and completeness
 
@@ -220,183 +312,25 @@ The planner normalizes the union into disjoint height slabs and row intervals,
 then partitions export units. X splitting happens during planning. New plans
 default to initial X widths of 450 and Z lengths of 50, saved independently
 of the hard 1023-block side limit and 9,000,000-block selection-volume limit.
-The coordinator refuses merges above the X/Z safety limit. Local merges carry
-`CapturePlanPieces` provenance, so subsequent audits can inspect original
-leaves even without the old progress file. Keep those leaf files.
+The run planner adds overlap padding and subdivides cores further if needed
+to stay within the same side and volume limits.
 
-Planning verifies that units do not overlap and that requested minus planned
-coverage is empty. The coordinator captures broader cuboids rather than
-tracking the shoreline edge: 100 blocks is the minimum horizontal margin,
-and extra edge terrain is allowed. The independent audit computes requested minus validated returned
-**three-dimensional** envelopes, including height gaps. Overlaps cannot inflate
-coverage. Missing, unreadable, malformed, empty, or out-of-bounds export records
-receive no credit. A shortened SizeY never silently establishes empty air.
+Planning verifies that cores do not overlap and requested minus planned
+coverage is empty. Cuboids may include extra edge terrain beyond the minimum
+100-block horizontal margin. Run auditing computes exact required regions
+minus validated core coverage; overlaps cannot inflate coverage. It also
+reports conservative gaps over the full initial Y range. A shortened SizeY
+does not silently establish omitted upper space as air.
 
-Each file also has a `column_presence` result counting requested, observed,
-and missing X/Z columns, with exact `missing_regions`. A column is observed
-when at least one block or decor record exists at any returned height.
-Columns without records or corroborating deeper-rescan evidence are removed
-from credited envelopes even when the file's SizeX/SizeZ spans them.
-The report's top-level `column_presence` checks
-the union against the requested footprint; per-file results include the extra
-padding in each selection. Missing files and invalid files receive no credit.
-A positive column check does not prove every height in that column loaded.
+Raw file validation records every X/Z column with no block/decor entry.
+Collection additionally checks the required surface height and vertical chunk
+strata, using fresh deeper probes when evidence is missing. Those probes must
+agree with all in-band records of the selected primary; otherwise the whole
+selection is retried. Sparse JSON alone cannot establish chunk residency or
+prove a simultaneous world snapshot. Loading acknowledgements, column
+confirmation, file provenance, and overlap comparisons supply the run's stated
+evidence, with these limits recorded in its audit.
 
-Collection validation rejects unverified columns. A column consisting entirely
-of air within the requested Y band triggers an automatic deeper rescan, as
-described below, instead of repeatedly subdividing the same air space.
-
-This proof is conditional on WorldEdit accurately reporting exported extents
-and contents. Sparse JSON alone cannot establish chunk residency or distinguish
-all missing terrain from intentionally omitted air. It also cannot establish a
-single simultaneous world snapshot across separate captures. The audit records
-these evidence limits rather than claiming stronger verification.
-
-## Automatic deeper rescans
-
-Normal collection keeps the saved plan's initial Y bounds (currently 65–180).
-When a direct export has columns without any block/decor records, the
-coordinator first force-loads the selection, teleports the player, checks the
-chunk queues, and retries the selection at its original Y bounds. This avoids
-turning an initially unloaded selection into a large batch of deeper probes.
-Any records recovered by that retry are saved immediately into formerly empty
-columns. Only holes that remain trigger 32-by-32 chunk exports from Y=0 through
-the selection's requested ceiling. Output reports the remaining column count
-and numbers each deeper probe within its finite batch.
-
-This recovery happens before the usual splitting fallback. Existing exports
-with holes also take this path on resume. Multiple holes and neighboring
-selections reuse a deeper probe when its bounds match and its retained data
-still validates. Normal-height retry exports are retained as
-`<prefix>_loaded_<bounds-hash>.json` and recorded in the progress file.
-
-Each fresh probe requests `/executeas PLAYER /chunk forceload ...`, waits for
-its acknowledgement, teleports the player into that chunk, and queries
-`/executeas PLAYER /chunk cit` until both queues report false. It then selects
-and exports the deeper area, validates its format, and requires a block/decor
-record in every probe column. It does not accept a queue response alone.
-Probe failures remain unverified and fall back to bounded collection recovery.
-Forced columns remain loaded until server restart; the coordinator does not
-restart the server. In step-by-step mode, deeper recovery commands follow
-automatically after the initial export confirmation.
-
-The coordinator reads acknowledgements from `../Logs/server-main.log` relative
-to the WorldEdit export directory. Override it for a different layout:
-
-```sh
-python3 -B vintage_story_export_coordinator.py \
-  --target-pane PANE --export-dir /absolute/path/to/WorldEdit \
-  --server-log /absolute/path/to/Logs/server-main.log
-```
-
-`--rescan-y-min 0` is the default. A different lower bound must be below the
-selection floor and keep the probe within selection limits. It changes only
-diagnostic probes, not the saved plan or its horizontal footprint. If the log
-cannot be read, empty columns stay unverified; the printed message identifies
-the path needed for `--server-log`. Preview and reporting never send commands.
-
-A deeper probe can yield three outcomes:
-
-- **In-band records recovered:** records at the requested Y heights are added
-  only to previously empty parent columns. Existing records and both block
-  layers are preserved; records below the requested floor remain in the probe.
-- **Empty band corroborated:** every probe column has records, but the highest
-  record in an affected column is below the requested floor. The retained
-  deeper export and load acknowledgements corroborate the empty band. No air
-  blocks are invented, and that column no longer triggers repeated retries.
-- **Still unverified:** invalid output, empty probe columns, failed commands,
-  or missing acknowledgements cannot establish the empty-band result.
-
-Before changing a parent, the coordinator saves its exact original bytes as
-`NAME.before-rescan-HASH.json` in the export directory. Replacement is atomic.
-Each completed deeper probe is applied to the parent and checkpointed before
-the next probe begins. If interrupted, an audit can credit the completed
-contributions while leaving the rest of the selection unverified. A parent
-with no direct block records can also retain partial, corroborated empty-band
-coverage. It is not marked complete until all columns are resolved.
-The parent includes `ColumnRescanEvidence` containing probe filenames, bounds,
-SHA256 values, load responses, and its backup reference. The progress file's
-`column_rescans` records cached probes and per-section results; commands and
-responses are under `<prefix>-commands/rescans/`. Probe filenames begin with
-`<prefix>_depth_`. Keep the parent, referenced probes, and source backups.
-Original entity blobs remain in parents; any additional probe entities remain
-in the raw probe rather than being merged without entity identity checks.
-
-Reporting revalidates and hashes referenced probes, so saved success alone
-cannot establish coverage. Missing, changed, or invalid probe files revoke
-their empty-band credit; the next collection run can capture new evidence.
-Per-file `column_presence.missing_columns` retains the raw no-record count,
-`empty_columns_confirmed_by_rescan` counts corroborated bands, and
-`unverified_columns` counts the remaining unknowns. At report level,
-`columns_without_direct_records` retains the raw deficit and `missing_columns`
-counts unverified columns after all sources are considered. Full-height credit
-for a corroborated empty band is conditional on WorldEdit correctly returning
-loaded contents; this is operational evidence, not a block-by-block air listing.
-Other trimmed-height gaps remain visible in the ordinary 3D report.
-
-Earlier versions applied probes only after the entire batch completed. An
-interrupted run could therefore have valid probe files and cached hashes but
-still show zero audited coverage for an empty parent. Updated collection
-applies those retained probes first on resume, before sending new commands.
-Reporting itself remains read-only with respect to exports: it does not merge
-unapplied cached probes into their parents. A fresh run should use a separate
-plan/run directory and the target instance's exports without old capture files.
-
-## Repair reported empty columns
-
-`tools/recapture_columns.py` is an operational repair utility for reports in
-the independent audit's format. The report must contain the matching
-`plan_hash`, `empty_columns` total, and `empty_column_rectangles` entries with
-`file`, `xmin`, `xmax`, `zmin`, `zmax`, and `columns`. Bounds must lie inside
-their named plan units and reported rectangles must not overlap.
-
-Prepare a reviewable request without contacting the server:
-
-```sh
-python3 -B tools/recapture_columns.py \
-  --report /absolute/path/to/independent-audit.json \
-  --export-dir /absolute/path/to/WorldEdit \
-  --work-dir repairs/coastal-connection-repair
-```
-
-Review `requests.json` in that work directory. To execute the same request,
-add `--execute --target-pane PANE --player PLAYER`, plus
-`--server-log /absolute/path/to/Logs/server-main.log`. If needed, add
-`--tmux-binary /absolute/path/to/tmux`. Do not run another collector or change
-the same player's WorldEdit selection while this utility runs.
-
-The utility requests `/chunk forceload` for the reported regions, then uses
-patches no larger than 128 X by 32 Z blocks at the plan's Y bounds. Each fresh
-patch gets a teleport and `/executeas PLAYER /chunk cit` queue check before
-selection/export. A queue check alone is insufficient; returned JSON must
-also pass the column check. Forced chunk columns remain pinned until the
-server restarts. The utility does not restart the server.
-
-A persistent completely empty patch uses the same deeper-probe machinery as
-normal collection. Probes are reused for nearby tiny holes. The utility records
-below-floor observations and attaches retained evidence to the parent before
-declaring its empty band corroborated. It does not fabricate air records or
-alter the plan's Y bounds.
-
-`results.json` records patch status, bounds, hashes, deeper observations, and
-parent replacements. `commands/` retains commands and server responses;
-`backups/` holds byte-for-byte parent originals. Repair and probe exports
-remain in the WorldEdit directory. Resuming with the same arguments reuses
-validated patches and unchanged completed parents.
-
-Only previously empty columns are overlaid into a parent, preserving its
-existing block/decor records and both block layers. Parent replacement is
-atomic and includes `ColumnRepairProvenance`; unresolved parents stay
-unchanged. Original entity blobs remain in parents; additional patch entities
-are retained in patch files rather than merged without entity identity
-checks. Synthetic merged parents must be repaired through their source leaves
-instead; this utility refuses to overlay them.
-
-`results.json`'s `complete` is recomputed from fresh parent validation and
-requires no unverified columns. Corroborated empty bands can satisfy that check.
-Run the normal coverage audit after repair to refresh the report and both
-previews. It can still report unverified columns or trimmed height; those
-limitations remain visible.
 
 ## Generate or revise a plan
 
@@ -436,7 +370,7 @@ cmp "$plan_draft_dir/plan.json" capture-plans/coastal-connection/plan.json
 | Change the requested height for the entire footprint | `create --ymin MIN --ymax MAX` |
 | Use smaller or larger initial sections | `create --x-span WIDTH --z-span DEPTH` |
 | Change the shoreline shape within the existing v12 area | Edit a geometry-file copy and use `create --geometry FILE` |
-| Add height over selected regions while retaining existing export unit names | `extend --plan FILE --regions REGIONS.json` |
+| Add height over selected regions in a revised plan | `extend --plan FILE --regions REGIONS.json` |
 | Include whole intersecting freshwater bodies | `create --freshwater BODIES.json`, or `extend --plan FILE --freshwater BODIES.json` |
 
 Every `create` command also requires `--ymin` and `--ymax`. Use `--output` to
@@ -541,15 +475,13 @@ python3 vintage_story_export_coordinator.py \
 ```
 
 That last command sends server commands after your confirmation. Progress and
-reports are written beside the selected draft, while world exports go in the
-configured export directory. Move a draft you intend to run into durable local
-storage first; a temporary directory is suitable for review, not long-term
-resume records.
+reports go in the run directory; raw world exports go in the configured server
+export directory. The run freezes its own plan copy, so later changes to the
+draft do not alter an existing capture.
 
 ### Make a reviewed revision the maintained plan
 
-Retain a frozen plan copy with the progress records of any unfinished run
-before changing the maintained specification. Then promote the reviewed JSON:
+Existing runs already contain frozen plan copies. Promote the reviewed JSON:
 
 ```sh
 cp "$plan_draft_dir/plan.json" capture-plans/coastal-connection/plan.json
@@ -580,13 +512,9 @@ automatically. Regenerate or discard an outdated PNG after changing the plan.
 Do not hand-edit `requests`, `cuboids`, export names, or hash fields in the
 expanded JSON. Editing it invalidates its content hash; changing the input and
 regenerating keeps geometry, coverage, and identifiers consistent. `create`
-assigns a new set of export names when inputs change. Use `extend` for additive
-height/lake coverage when you want existing export unit names retained; it
-does not change the existing section sizes or remove requested coverage.
-
-Historical run records and world exports should be retained locally rather
-than exposed as extra maintained plan revisions. A plan file does not itself
-contain the collected terrain data.
+assigns a new plan identity when inputs change. `extend` adds height/lake
+coverage while preserving existing partition bounds; the revised plan requires
+a separate capture run. A plan file contains geometry, not collected terrain.
 
 ## Additional height coverage
 
@@ -606,16 +534,12 @@ Supply a JSON file such as `height-regions.json`:
 python3 v12_capture_plan.py extend --plan PLAN.json --regions height-regions.json --output /tmp/coastal-connection-revised.json
 ```
 
-This creates a draft revision with a separate plan/progress identity. It retains old export unit
-names so existing JSON files in the same export directory can be reused, and
-adds only the region outside existing planned units. Overlapping new height
-requests are deduplicated. The old plan and progress remain untouched.
-New units inherit the parent plan's saved X/Z caps, including freshwater
-extensions. Older plans without an X cap retain their previous 1023-block
-policy when extended; use the new 160-unit plan for smaller sections.
-`requested_y` records the initial bounds; `added_regions` and `requests` record
-all additional bounds. Extending already-planned space is not a retry of a
-failed or shortened export: the audit reports those gaps separately.
+This creates a draft revision with a separate plan identity and export-unit
+names. It adds only regions outside the existing planned units and deduplicates
+overlapping requests. The new units inherit the parent plan's explicit X/Z
+caps. `requested_y` records the initial bounds; `added_regions` and `requests`
+record all additional bounds. Start a separate capture run for the revised
+plan; exports from the original plan are not adopted into it.
 
 ## Whole freshwater bodies
 
@@ -644,8 +568,8 @@ python3 v12_capture_plan.py extend --plan PLAN.json --freshwater freshwater-bodi
 ```
 
 The extension command adds newly mapped lakes in a draft plan revision while
-retaining old export unit names and reusing their files. It exports only body
-regions outside the previously planned units. Repeated body IDs must keep the
+preserving existing partition bounds and adding only body regions outside
+previously planned units. The revised plan requires a separate capture run. Repeated body IDs must keep the
 same definition; use a new ID for revised boundaries. Height extension is also
 available for rectangular supplemental regions, but does not discover lake
 boundaries.
@@ -657,15 +581,14 @@ python3 -B -m unittest discover -s tests -v
 ```
 
 Tests include exact subtraction against a voxel oracle, independent high
-precision curve inversion, all three mouth/gap transitions and buffer ends,
-selection limits, disjoint partitions, hash integrity, lake inclusion, height
-extensions, corrupt exports, ceiling flags, shortened Y, merged-leaf height
-gaps, exact internal column holes, decor presence, repair overlays, and offline
-coordinator reporting. They do not contact a server.
+precision curve inversion, mouth/gap transitions and buffer ends, selection
+limits, disjoint partitions, hash integrity, lake inclusion, height extensions,
+raw export validation, whole-section retries, deeper shaft confirmations,
+overlap mismatches, final completion gates, automatic compatible continuation,
+and status signals. They use simulated exports and do not contact a server.
 
-The guide is in `docs/`, tests are in `tests/`, repair utilities are in `tools/`, and the application modules
-remain at the repository root. The plan JSON, coastline input, and changelog
-belong together in `capture-plans/coastal-connection/`. Generated previews,
-commands, progress files, coverage reports, and temporary files are ignored by
-Git. Retain progress and exported data locally when needed for resume or audit;
-ignoring them does not make them disposable.
+Application modules are at the repository root, instructions in `docs/`, and
+tests in `tests/`. The plan JSON, coastline input, and visible changelog belong
+together in `capture-plans/coastal-connection/`. Generated previews, commands,
+progress, and audits are excluded from Git. Retain current run manifests and
+selected exports when needed for continuation or audit.

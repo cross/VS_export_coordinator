@@ -18,19 +18,23 @@ Repository layout:
 - `vintage_story_export_coordinator.py`: collection commands, retries, and
   resume using a specified coastline plan. This is the primary tool; it
   currently defaults to `capture-plans/coastal-connection/plan.json`
-- `v12_capture_plan.py`: planning, previews, and independent coverage auditing.
+- `v12_capture_plan.py`: planning, previews, and raw WorldEdit validation.
   Imported by `vintage_story_export_coordinator.py`
-- `capture_rescan.py`: automatic chunk-sized deeper exports for empty columns,
-  with acknowledged loading, repairs, and retained audit evidence.
+- `capture_run.py`: isolated capture runs, fresh immutable attempts, whole-section
+  retries, deeper confirmations, and overlap/coverage certification. This is
+  the default collection engine.
+- `server_console.py`: console commands and acknowledgements from the server log.
 - `capture-plans/coastal-connection/`: current plan, coastline input, and
   changelog; Git retains earlier plan revisions.
 - `docs/`: operating instructions and design information.
 - `tests/`: automated tests using simulated exports; no server is contacted.
-- `tools/recapture_columns.py`: targeted repair utility for an independent
-  empty-column report; see [repair instructions](docs/V12_CAPTURE.md#repair-reported-empty-columns).
 
-Normal collection automatically rescans empty columns at deeper Y levels;
-see [automatic deeper rescans](docs/V12_CAPTURE.md#automatic-deeper-rescans).
+New captures use a unique run ID. Repeating the same plan command automatically
+continues a compatible run; `--new-run` requests a separate fresh capture.
+`--resume RUN_DIRECTORY` selects a particular run explicitly. See
+[isolated runs](docs/V12_CAPTURE.md#isolated-captures-and-compatible-resume).
+Only the current run format is supported. Coverage reports require a run
+manifest; loose files and older progress formats are not imported.
 
 Run the tests from the repository root:
 

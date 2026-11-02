@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline v12 capture planning and independent three-dimensional coverage audit.
+"""Offline v12 capture planning, previews, and raw WorldEdit validation.
 
 All bounds are inclusive, in relative Vintage Story block coordinates. No server
 commands are issued by this module. The saved plan, not current source geometry,
-is the authority for resume, preview, and audit.
+defines the requested capture geometry. Run audits are handled by capture_run.
 """
 from __future__ import annotations
 
@@ -305,8 +305,7 @@ def seal_plan(payload: dict) -> dict:
     payload["prefix"] = "v12_capture_" + seed
     for index, task in enumerate(payload["cuboids"], 1):
         task["index"] = index
-        if "name" not in task:  # Extension plans retain old filenames for reuse.
-            task["name"] = f"{payload['prefix']}_{index:05d}"
+        task["name"] = f"{payload['prefix']}_{index:05d}"
     payload["plan_hash"] = digest(payload)
     return payload
 
@@ -343,7 +342,7 @@ def create_plan(ymin: int, ymax: int, geometry: Path, z_span: int = 50,
 
 
 def extend_plan(parent: dict, regions: list[dict], freshwater: Path | None = None) -> dict:
-    """Add explicit 3D requests, keeping old export units and files reusable."""
+    """Add explicit 3D requests while keeping the existing partition bounds."""
     tasks = [dict(b) for b in parent["cuboids"]]
     added = [box(b) for b in regions]
     lakes = []
@@ -353,9 +352,7 @@ def extend_plan(parent: dict, regions: list[dict], freshwater: Path | None = Non
         added.extend(extra)
     if not added:
         raise ValueError("At least one additional height/region request is required")
-    # Older saved plans did not have an operational X cap. Keep their policy
-    # for extensions; new plans persist and inherit the smaller configured cap.
-    x_span = parent["partition"].get("x_span", MAX_SIDE)
+    x_span = parent["partition"]["x_span"]
     for region in added:
         for piece in difference([region], tasks):
             tasks.extend(limited_boxes(piece, parent["partition"]["z_span"], x_span))
@@ -396,7 +393,9 @@ def verify_plan(plan: dict) -> None:
         raise ValueError("Unsafe capture prefix")
     if not plan["requests"] or not plan["cuboids"]:
         raise ValueError("Empty capture plan")
-    x_span = plan["partition"].get("x_span", MAX_SIDE)
+    if not all(key in plan["partition"] for key in ("x_span", "z_span")):
+        raise ValueError("Capture plan requires explicit X/Z span caps")
+    x_span = plan["partition"]["x_span"]
     z_span = plan["partition"]["z_span"]
     if any(type(n) is not int or not 1 <= n <= MAX_SIDE for n in (x_span, z_span)):
         raise ValueError("Invalid planned X/Z span")
@@ -459,8 +458,7 @@ def column_presence_record(requested: dict, present: bytearray) -> dict:
             "basis": "At least one Indices or DecorIndices record at any returned height; missing columns are unverified, never inferred air."}
 
 
-def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER,
-                   *, allow_rescans: bool = True) -> dict:
+def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER) -> dict:
     """Verify sparse records and credit only the actual reported 3D envelope.
 
     This establishes coverage under WorldEdit's reported-envelope contract. It
@@ -540,162 +538,14 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
                              "ymin": requested["ymin"], "ymax": requested["ymin"] + sy - 1,
                              "zmin": requested["zmin"], "zmax": requested["zmin"] + sz - 1}
         result["verified_regions"] = difference([result["covered"]], result["column_presence"]["missing_regions"])
-        confirmed = []
-        if allow_rescans and data.get("ColumnRescanEvidence"):
-            try:
-                confirmed, result["rescans"] = verify_column_rescans(
-                    path, requested, present, data["ColumnRescanEvidence"], world_center)
-            except (OSError, ValueError, TypeError, KeyError) as exc:
-                # Preserve credit for direct records, but never credit an
-                # empty band whose external evidence is missing or changed.
-                result["rescan_problems"] = [str(exc)]
-            result["verified_regions"].extend(confirmed)
-        confirmed_columns = sum(volume(b) // (requested["ymax"] - requested["ymin"] + 1) for b in confirmed)
-        result["column_presence"].update(
-            empty_columns_confirmed_by_rescan=confirmed_columns,
-            unverified_columns=result["column_presence"]["missing_columns"] - confirmed_columns,
-            unverified_regions=difference(result["column_presence"]["missing_regions"], confirmed))
-        if not blocks and not data.get("DecorIndices") and not confirmed_columns:
+        if not blocks and not data.get("DecorIndices"):
             raise ValueError("Empty sparse export cannot establish coverage")
-        if "CapturePlanPieces" in data:
-            provenance = data["CapturePlanPieces"]
-            if not isinstance(provenance, list) or not provenance:
-                raise ValueError("Invalid merged-export provenance")
-            for item in provenance:
-                child = box(item)
-                if intersection(child, requested) != child or not isinstance(item["file"], str):
-                    raise ValueError("Merged-export piece outside selection")
-            result["pieces"] = provenance
         result["sha256"] = hashlib.sha256(payload).hexdigest()
     except (OSError, ValueError, TypeError, KeyError, UnicodeError) as exc:
         result["problems"].append(str(exc))
         result["covered"] = None
         result["verified_regions"] = []
     return result
-
-
-def verify_column_rescans(path: Path, requested: dict, present: bytearray,
-                         metadata: dict, world_center: int) -> tuple[list[dict], list[dict]]:
-    """Recheck retained, hash-bound deeper evidence; never trust saved status alone."""
-    if not isinstance(metadata, dict) or metadata.get("version") != 1 or not isinstance(metadata.get("probes"), list):
-        raise ValueError("Invalid column-rescan evidence")
-    confirmed = bytearray(len(present))
-    width = requested["xmax"] - requested["xmin"] + 1
-    evidence_records = []
-    for ref in metadata["probes"]:
-        filename = ref["file"]
-        if not isinstance(filename, str) or Path(filename).name != filename:
-            raise ValueError("Rescan reference must be a filename in the export directory")
-        bounds = box(ref["requested"])
-        check = ref.get("load_check", {})
-        if not (check.get("force_loaded") is True and check.get("queues_clear") is True):
-            raise ValueError("Rescan lacks an acknowledged chunk-load check")
-        if bounds["ymin"] >= requested["ymin"] or bounds["ymax"] < requested["ymax"]:
-            raise ValueError("Rescan must cover below the floor and through the requested ceiling")
-        probe_path = path.parent / filename
-        probe = inspect_export(probe_path, bounds, world_center, allow_rescans=False)
-        if probe["problems"] or probe.get("sha256") != ref.get("sha256") or probe["column_presence"]["missing_columns"]:
-            raise ValueError("Rescan missing, changed, invalid, or still has empty columns: " + filename)
-        data = read_json(probe_path)
-        tops = {}
-        for field in ("Indices", "DecorIndices"):
-            for index in data.get(field, []):
-                x, z = bounds["xmin"] + (index & 1023), bounds["zmin"] + ((index >> 10) & 1023)
-                tops[x, z] = max(tops.get((x, z), bounds["ymin"] - 1), bounds["ymin"] + (index >> 20))
-        count = 0
-        for (x, z), top in tops.items():
-            if requested["xmin"] <= x <= requested["xmax"] and requested["zmin"] <= z <= requested["zmax"]:
-                offset = (z - requested["zmin"]) * width + x - requested["xmin"]
-                if not present[offset] and top < requested["ymin"]:
-                    confirmed[offset] = 1
-                    count += 1
-        evidence_records.append({**ref, "empty_columns_below_floor": count})
-    # Inverting the confirmation mask reuses the exact row-to-rectangle routine.
-    regions = column_presence_record(requested, bytearray(1 - v for v in confirmed))["missing_regions"]
-    return regions, evidence_records
-
-
-def audit_coverage(plan: dict, state: dict, export_dir: Path, progress=None) -> dict:
-    covers, column_covers, direct_column_covers, files, warnings = [], [], [], [], []
-    seen = set()
-    sections = state.get("sections", {})
-
-    def collect(region: dict, name: str, ceiling: int, ancestors: set[str]) -> None:
-        if name in ancestors:
-            raise ValueError("Cycle in saved export tree")
-        record = sections.get(name, {})
-        # Saved filenames are metadata; use the chosen export directory only.
-        path = export_dir / (name + ".json")
-        key = (str(path), tuple(region[k] for k in BOUND_KEYS))
-        if key in seen:
-            return
-        seen.add(key)
-        evidence = inspect_export(path, region, plan["world_center"])
-        files.append(evidence)
-        if evidence["covered"] and not evidence.get("pieces") and not record.get("merged"):
-            # A direct WorldEdit parent may now validate after a format fix,
-            # even while old progress still records failed subdivision work.
-            verified = evidence["verified_regions"]
-            covers.extend(verified)
-            column_covers.extend({**b, "ymin": 0, "ymax": 0} for b in verified)
-            direct = difference([evidence["covered"]], evidence["column_presence"]["missing_regions"])
-            direct_column_covers.extend({**b, "ymin": 0, "ymax": 0} for b in direct)
-            if evidence["ceiling_blocks"] and region["ymax"] == ceiling:
-                warnings.append(f"{name}: {evidence['ceiling_blocks']} block/decor entries at requested Y ceiling {ceiling}")
-        # Merged envelopes cannot bridge missing leaf height. Prefer embedded
-        # provenance, or use all retained AND pending children from progress.
-        if evidence["covered"] and evidence.get("pieces"):
-            children = evidence["pieces"]
-        elif record.get("segmented"):
-            children = record.get("piece_regions", []) + record.get("children", [])
-        else:
-            children = []
-        for item in children:
-            child = box(item)
-            child_name = item.get("name") or Path(item["file"]).stem
-            if intersection(child, region) != child:
-                warnings.append(f"Discarded piece outside parent: {child_name}")
-                continue
-            collect(child, child_name, ceiling, ancestors | {name})
-
-    for index, task in enumerate(plan["cuboids"], 1):
-        if progress:
-            progress(index, len(plan["cuboids"]), task["name"])
-        collect(box(task), task["name"], task["ymax"], set())
-    gaps = difference(plan["requests"], covers)
-    total = sum(volume(b) for b in plan["requests"])
-    missing = sum(volume(b) for b in gaps)
-    column_requests = row_boxes(rows_for_boxes(plan["requests"]), 0, 0)
-    column_gaps = difference(column_requests, column_covers)
-    requested_columns = sum(volume(b) for b in column_requests)
-    missing_columns = sum(volume(b) for b in column_gaps)
-    without_direct_records = sum(volume(b) for b in difference(column_requests, direct_column_covers))
-    return {"version": VERSION, "plan_hash": plan["plan_hash"], "geometry_hash": plan["geometry_hash"],
-            "requested_blocks": total, "verified_envelope_blocks": total - missing,
-            "coverage_percent": 100 * (total - missing) / total,
-            "complete": not gaps, "gaps": gaps, "warnings": warnings, "files": files,
-            "column_presence": {"requested_columns": requested_columns,
-                "observed_columns": requested_columns - missing_columns,
-                "missing_columns": missing_columns, "complete": not column_gaps,
-                "columns_without_direct_records": without_direct_records,
-                "empty_columns_confirmed_by_rescan": without_direct_records - missing_columns,
-                "missing_regions": [{k: b[k] for k in ("xmin", "xmax", "zmin", "zmax")} for b in column_gaps],
-                "files_with_missing_columns": sum(bool(f.get("column_presence", {}).get("missing_columns")) for f in files),
-                "files_with_unverified_columns": sum(bool(f.get("column_presence", {}).get("unverified_columns")) for f in files)},
-            "coverage_basis": "Exact requested 3D union minus freshly validated reported export envelopes and hash-checked deeper rescans with acknowledged load checks. Uncorroborated absent columns and shortened Y remain unverified. Rescans corroborate empty bands conditionally on WorldEdit returning loaded contents.",
-            "evidence_limits": "Conditional on WorldEdit accurately reporting exported extents and loaded contents. Sparse JSON alone cannot prove missing records are air or that chunks were resident. Exports at different times are not an atomic world snapshot."}
-
-
-def audit_progress(index: int, total: int, name: str) -> None:
-    if index == 1 or index % 10 == 0 or index == total:
-        print(f"Auditing export {index}/{total}: {name}", flush=True)
-
-
-def render_column_preview(plan: dict, report: dict, path: Path) -> None:
-    regions = [{**b, "ymin": min(r["ymin"] for r in plan["requests"]),
-                "ymax": max(r["ymax"] for r in plan["requests"])}
-               for b in report["column_presence"]["missing_regions"]]
-    render_preview(plan, path, regions, gap_label="unverified columns")
 
 
 def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None,
@@ -724,7 +574,7 @@ def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None,
     layers = [f'<rect width="{width+72:.3f}" height="{height+185:.3f}" fill="#f4f7fb"/>',
               '<g font-family="sans-serif" fill="#15283c">',
               '<text x="24" y="30" font-size="21">v12 capture footprint and export mosaic</text>',
-              f'<text x="24" y="53" font-size="12">{len(plan["cuboids"])} units · X ≤{plan["partition"].get("x_span", MAX_SIDE)}, Z ≤{plan["partition"]["z_span"]} · {extra:,} extra block positions</text>',
+              f'<text x="24" y="53" font-size="12">{len(plan["cuboids"])} units · X ≤{plan["partition"]["x_span"]}, Z ≤{plan["partition"]["z_span"]} · {extra:,} extra block positions</text>',
               f'<text x="24" y="73" font-size="12">Blue: buffered request · dark blue: mouths/gap · orange: cuboids · red: {escape(gap_label)}</text>',
               f'<text x="24" y="93" font-size="12">X {xmin}..{xmax} → · Z {zmin}..{zmax} ↓ · requested Y {plan["requested_y"]["ymin"]}..{plan["requested_y"]["ymax"]}</text>',
               f'<text x="24" y="113" font-size="11">Plan SHA256 {plan["plan_hash"]}</text>',
@@ -755,7 +605,7 @@ def print_summary(plan: dict, path: Path) -> None:
     exported = sum(volume(b) for b in plan["cuboids"])
     print(f"Plan: {path}\nPreview: {path.with_suffix('.svg')}\nPrefix: {plan['prefix']}")
     print(f"{len(plan['cuboids']):,} nonoverlapping exports; {requested:,} requested block positions; {exported-requested:,} extra.")
-    print(f"Initial size caps: X {plan['partition'].get('x_span', MAX_SIDE)}, Z {plan['partition']['z_span']}; largest unit {max(volume(b) for b in plan['cuboids']):,} block positions.")
+    print(f"Initial size caps: X {plan['partition']['x_span']}, Z {plan['partition']['z_span']}; largest unit {max(volume(b) for b in plan['cuboids']):,} block positions.")
     print(f"SHA256: {plan['plan_hash']}\nNo server commands sent.")
 
 
@@ -771,15 +621,11 @@ def main() -> int:
                         help="maximum initial X width (default: 450; hard maximum: 1023)")
     create.add_argument("--freshwater", type=Path, help="JSON bodies with complete integer row intervals")
     create.add_argument("--output", type=Path)
-    extend = commands.add_parser("extend", help="add height/region requests in a NEW plan; retain old export units")
+    extend = commands.add_parser("extend", help="add height/region requests in a new plan")
     extend.add_argument("--plan", type=Path, required=True)
     extend.add_argument("--regions", type=Path, help="JSON object with regions: [inclusive cuboid bounds]")
-    extend.add_argument("--freshwater", type=Path, help="add whole intersecting freshwater bodies while reusing old units")
+    extend.add_argument("--freshwater", type=Path, help="add whole intersecting freshwater bodies")
     extend.add_argument("--output", type=Path)
-    audit = commands.add_parser("audit", help="revalidate files and report exact X/Y/Z gaps")
-    audit.add_argument("--plan", type=Path, required=True)
-    audit.add_argument("--export-dir", type=Path, required=True)
-    audit.add_argument("--progress", type=Path)
     args = parser.parse_args()
     try:
         if args.command == "create":
@@ -793,22 +639,6 @@ def main() -> int:
             plan = extend_plan(load_plan(args.plan), read_json(args.regions)["regions"] if args.regions else [], args.freshwater)
             path = write_plan(plan, args.output)
             print_summary(plan, path)
-        else:
-            plan = load_plan(args.plan)
-            progress = args.progress or args.plan.with_name(plan["prefix"] + "-progress.json")
-            state = read_json(progress) if progress.exists() else {}
-            if state and state.get("signature", {}).get("capture_plan_hash") != plan["plan_hash"]:
-                raise ValueError("Progress belongs to a different capture plan")
-            report = audit_coverage(plan, state, args.export_dir.expanduser(), progress=audit_progress)
-            output = args.plan.with_name(plan["prefix"] + "-audit.json")
-            output.write_text(json.dumps(report, indent=2) + "\n")
-            render_preview(plan, args.plan.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
-            render_column_preview(plan, report, args.plan.with_name(plan["prefix"] + "-columns.svg"))
-            print(f"3D coverage: {report['coverage_percent']:.6f}%; {len(report['gaps'])} exact gap boxes; {len(report['warnings'])} ceiling warnings.")
-            print(f"Unverified columns: {report['column_presence']['missing_columns']:,}; "
-                  f"empty bands corroborated by deeper rescans: {report['column_presence']['empty_columns_confirmed_by_rescan']:,}.")
-            print(f"Audit: {output}\n{report['evidence_limits']}")
-            return 0 if report["complete"] else 1
     except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
         parser.exit(2, f"Error: {exc}\n")
     return 0
