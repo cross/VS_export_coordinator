@@ -118,6 +118,43 @@ status or the current coastline source. Exit codes: 0 means the requested 3D
 union is covered by validated reported envelopes, 1 means gaps remain, and 2
 means an input/error condition.
 
+### Collection completion and audit completion
+
+The progress file and execution coverage manifest distinguish these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `finished` | Every planned root selection is complete or manually accepted. Skipped selections and unresolved recovery regions keep this false. |
+| `coverage_complete` | The latest completed audit verifies the entire requested 3D volume. `null` means the current audit has not produced a final result. |
+| `column_coverage_complete` | The latest completed audit accounts for every requested X/Z column through records or corroborating deeper evidence. Also `null` before a final audit result. |
+| `audit_status` | `not_run`, `running`, `complete`, `interrupted`, or `failed`; `complete` means the audit ran to completion, even if coverage gaps remain. |
+
+`finished` is recomputed on every checkpoint and becomes true as soon as all
+planned selections are resolved, before the final audit. Counts use only the
+plan's root selections, so old recovery children cannot inflate completion.
+The `completion` object records these counts and unresolved selection names.
+Manual acceptance resolves an execution item without proving its coverage.
+
+The final audit refreshes root statuses from the exports and source pieces it
+actually checked, writes current completion fields to the checkpoint and
+execution manifest, then prints its final summary. A coordinator
+`--report-coverage` for the saved instance also refreshes that checkpoint;
+reporting against a different export directory leaves the saved instance's
+checkpoint untouched. Export files remain unchanged by reporting.
+
+This is completion schema version 2 (`completion.version`). Previously,
+`finished` mirrored full 3D audit success. Thus an otherwise completed capture
+could have `finished: false` because omitted upper air remained unverified.
+Now that case has `finished: true`, `coverage_complete: false`, and usually
+`column_coverage_complete: true`. The audit JSON retains `complete` for full
+3D coverage and adds `collection_finished` and `collection_completion` for
+execution completion. Exit codes still follow the 3D audit result, so a
+finished collection can return 1 while conservative height gaps remain.
+
+Starting collection or an audit clears the current coverage-result fields to
+`null`. Interruption/failure never turns an old audit success into a new one;
+collection checkpoints remain available independently of the audit outcome.
+
 The saved plan embeds shoreline geometry, requested regions, export units,
 geometry version/hash, source-file hash, coordinate convention, and selection
 limits. A full content hash detects edits. Create a new plan to change bounds,

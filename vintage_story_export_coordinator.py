@@ -268,7 +268,27 @@ def uncovered_remainder(c: Cuboid, returned: dict[str, int] | None) -> list[dict
     return capture_plan.difference([cuboid_record(c)], [returned] if returned else [])
 
 
+def update_collection_completion(state: dict[str, Any]) -> None:
+    """Collection completion is independent of the conservative 3D audit."""
+    planned = state.get("planned_sections")
+    if not isinstance(planned, list) or not planned:
+        return
+    sections = state.get("sections", {})
+    verified = [name for name in planned if sections.get(name, {}).get("status") == "complete"
+                and not sections[name].get("gaps")]
+    accepted = [name for name in planned if sections.get(name, {}).get("status") == "accepted"]
+    resolved = set(verified) | set(accepted)
+    state["finished"] = len(resolved) == len(planned)
+    state["completion"] = {
+        "version": 2, "planned_selections": len(planned), "resolved_selections": len(resolved),
+        "verified_selections": len(verified), "manually_accepted_selections": len(accepted),
+        "unresolved_selections": [name for name in planned if name not in resolved],
+        "basis": "All planned root selections are complete or manually accepted; coverage is audited separately.",
+    }
+
+
 def save_state(path: Path, state: dict[str, Any]) -> None:
+    update_collection_completion(state)
     state["updated_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
@@ -278,6 +298,8 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
         "signature": state.get("signature"), "updated_utc": state["updated_utc"],
         "coverage_basis": "Execution checkpoint only. Use the saved plan's independent 3D audit for verified coverage and exact height gaps.",
         "sections": state.get("sections", {}),
+        **{key: state[key] for key in ("finished", "completion", "coverage_complete",
+                                      "column_coverage_complete", "audit_status") if key in state},
     }
     manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
     manifest_tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -983,19 +1005,100 @@ def revalidate_existing_exports(cuboids: list[Cuboid], state: dict, export_dir: 
     return complete, accepted, incomplete, absent
 
 
-def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path) -> int:
+def refresh_collection_from_audit(plan: dict, report: dict, state: dict) -> None:
+    """Refresh root checkpoints from the files just audited, without rereading them."""
+    state["planned_sections"] = [item["name"] for item in plan["cuboids"]]
+    sections = state.setdefault("sections", {})
+    def key(name, bounds):
+        return name, tuple(bounds[k] for k in capture_plan.BOUND_KEYS)
+    evidence_by_key = {key(Path(item["file"]).stem, item["requested"]): item for item in report["files"]}
+    def usable(item):
+        columns = item.get("column_presence", {})
+        return (not item["problems"] and item.get("covered") is not None
+                and not columns.get("unverified_columns", columns.get("missing_columns", 0)))
+    def resolved(name, bounds, ancestors):
+        if name in ancestors:
+            return False
+        item = evidence_by_key.get(key(name, bounds))
+        if item is None:
+            return False
+        previous = sections.get(name, {})
+        if previous.get("status") == "accepted" and Path(item["file"]).is_file():
+            return True
+        if usable(item) and not item.get("pieces") and not previous.get("merged"):
+            return True
+        children = item.get("pieces", []) if item.get("covered") else []
+        if not children and previous.get("segmented"):
+            children = previous.get("piece_regions", []) + previous.get("children", [])
+        if not children:
+            return False
+        bounds_list = [capture_plan.box(child) for child in children]
+        if any(capture_plan.intersection(child, bounds) != child for child in bounds_list):
+            return False
+        if capture_plan.difference([bounds], bounds_list):
+            return False
+        return all(resolved(child.get("name") or Path(child["file"]).stem, child_bounds, ancestors | {name})
+                   for child, child_bounds in zip(children, bounds_list))
+    for task in plan["cuboids"]:
+        name, bounds = task["name"], capture_plan.box(task)
+        previous = sections.get(name, {})
+        item = evidence_by_key.get(key(name, bounds))
+        if resolved(name, bounds, set()):
+            if previous.get("status") == "accepted":
+                continue
+            if item and usable(item) and not item.get("pieces") and not previous.get("merged"):
+                c = Cuboid(task["index"], **bounds, name=name)
+                sections[name] = validated_export_record(c, Path(item["file"]), previous, evidence=item)
+            else:
+                sections[name] = {**previous, "status": "complete", "gaps": []}
+        elif previous.get("segmented"):
+            sections[name] = {**previous, "status": "partial"}
+        else:
+            columns = item.get("column_presence", {}) if item else {}
+            problems = list(item["problems"]) if item else ["No audited export evidence"]
+            if columns.get("unverified_columns", columns.get("missing_columns", 0)):
+                problems.append("Column coverage remains unverified")
+            sections[name] = {**previous, "status": "incomplete",
+                              "problems": problems, "column_presence": columns,
+                              "returned_bounds": item.get("covered") if item else None}
+    update_collection_completion(state)
+
+
+def write_plan_audit(plan: dict, plan_path: Path, state: dict, export_dir: Path,
+                     state_path: Path | None = None) -> int:
     report_activity("Starting coverage audit", clear_region=True)
+    state["planned_sections"] = [item["name"] for item in plan["cuboids"]]
+    state.update(audit_status="running", coverage_complete=None, column_coverage_complete=None)
+    update_collection_completion(state)
+    if state_path:
+        save_state(state_path, state)
     def progress(index, total, name):
         report_activity(f"Auditing export {index}/{total}: {name}", clear_region=True)
         capture_plan.audit_progress(index, total, name)
-    report = capture_plan.audit_coverage(plan, state, export_dir, progress=progress)
-    report_activity("Writing coverage report and previews", clear_region=True)
-    path = plan_path.with_name(plan["prefix"] + "-audit.json")
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(report, indent=2) + "\n")
-    tmp.replace(path)
-    capture_plan.render_preview(plan, plan_path.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
-    capture_plan.render_column_preview(plan, report, plan_path.with_name(plan["prefix"] + "-columns.svg"))
+    try:
+        report = capture_plan.audit_coverage(plan, state, export_dir, progress=progress)
+        refresh_collection_from_audit(plan, report, state)
+        report["collection_finished"] = state["finished"]
+        report["collection_completion"] = state["completion"]
+        report_activity("Writing coverage report and previews", clear_region=True)
+        path = plan_path.with_name(plan["prefix"] + "-audit.json")
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(report, indent=2) + "\n")
+        tmp.replace(path)
+        capture_plan.render_preview(plan, plan_path.with_name(plan["prefix"] + "-coverage.svg"), report["gaps"])
+        capture_plan.render_column_preview(plan, report, plan_path.with_name(plan["prefix"] + "-columns.svg"))
+    except BaseException as exc:
+        state["audit_status"] = "interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "failed"
+        if state_path:
+            try_save_state(state_path, state)
+        raise
+    state.update(audit_status="complete", coverage_complete=report["complete"],
+                 column_coverage_complete=report["column_presence"]["complete"])
+    if state_path:
+        save_state(state_path, state)
+    print(f"Collection finished: {state['finished']} "
+          f"({state['completion']['resolved_selections']}/{state['completion']['planned_selections']} selections resolved). "
+          f"Full requested 3D coverage verified: {state['coverage_complete']}.")
     print(f"Verified reported 3D coverage: {report['coverage_percent']:.6f}% "
           f"({report['verified_envelope_blocks']:,}/{report['requested_blocks']:,} positions).")
     print(f"Exact uncovered regions: {len(report['gaps'])}. Audit: {path}")
@@ -1053,7 +1156,13 @@ def _main(status_reporter: RunStatus) -> int:
             if not export_path:
                 parser.error("--export-dir is required until this plan has a saved run")
             print_status_help()
-            return write_plan_audit(plan, args.plan, state, Path(export_path).expanduser().resolve())
+            export_path = Path(export_path).expanduser().resolve()
+            # A report may inspect a different directory, but must not replace
+            # the existing instance's saved execution checkpoint in that case.
+            saved_export = state.get("signature", {}).get("export_dir")
+            checkpoint = progress if progress.exists() and saved_export and Path(saved_export).expanduser().resolve() == export_path else None
+            audit_state = state if checkpoint else {}
+            return write_plan_audit(plan, args.plan, audit_state, export_path, state_path=checkpoint)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))
 
@@ -1086,6 +1195,8 @@ def _main(status_reporter: RunStatus) -> int:
     state_path = run_dir / f"{prefix}-progress.json"
     try:
         state = load_state(state_path, signature)
+        state["planned_sections"] = [c.name for c in cuboids]
+        state.update(audit_status="not_run", coverage_complete=None, column_coverage_complete=None)
         state["rescan_settings"] = {"ymin": args.rescan_y_min,
             "server_log": str(args.server_log.expanduser().resolve()) if args.server_log else None}
         command_dir.mkdir(parents=True, exist_ok=True)
@@ -1195,9 +1306,7 @@ def _main(status_reporter: RunStatus) -> int:
                     split_immediately=True, tmux_binary=tmux_binary)
                 finalize_split_result(c, pieces, gaps, export_dir, state, state_path)
                 break
-        result = write_plan_audit(plan, args.plan, state, export_dir)
-        state["finished"] = result == 0
-        save_state(state_path, state)
+        result = write_plan_audit(plan, args.plan, state, export_dir, state_path=state_path)
         return result
     except (KeyboardInterrupt, EOFError, UserQuit):
         signal.signal(signal.SIGINT, abort_immediately)
