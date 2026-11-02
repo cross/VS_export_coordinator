@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import time
 import uuid
 
@@ -37,6 +38,10 @@ class CaptureError(ValueError):
 
 class CompatibilityError(CaptureError):
     """Compatibility needs operator review; retrying cannot establish it."""
+
+
+class RetryLimitError(CaptureError):
+    """Automatic attempts are exhausted; the operator can authorize another."""
 
 
 def atomic_json(path, value):
@@ -167,6 +172,16 @@ def wait_fresh(path, issued_ns, timeout=90, stable_seconds=2, poll=.25):
 
 def padded(core, overlap):
     return {**p.box(core), 'xmax':core['xmax']+overlap, 'zmax':core['zmax']+overlap}
+
+
+def bounds_label(bounds):
+    dimensions='×'.join(str(bounds[axis+'max']-bounds[axis+'min']+1) for axis in p.AXES)
+    return (f"X {bounds['xmin']}..{bounds['xmax']}, Y {bounds['ymin']}..{bounds['ymax']}, "
+            f"Z {bounds['zmin']}..{bounds['zmax']} ({dimensions} blocks)")
+
+
+def count_label(count,noun):
+    return f"{count} {noun}{'' if count==1 else 's'}"
 
 
 def run_units(plan, overlap):
@@ -307,6 +322,7 @@ class Run:
         self.path=self.directory/(state['run_id']+'-progress.json')
         self.console,self.wait=console,wait
         self.verbose=False
+        self.recovery_handler=None
         self.activity=activity or (lambda description,unit=None:None)
         self.units={unit['id']:unit for unit in state['units']}
         self.pairs=overlap_pairs(state['units'])
@@ -314,6 +330,36 @@ class Run:
         for pair in self.pairs:
             for name in (pair['left'],pair['right']):
                 self.incident[name].append(pair)
+
+    def announce(self,description,unit=None):
+        self.activity(description,unit)
+        print('  '+description,flush=True)
+
+    def section_attempt_limit(self,record):
+        return max(self.state['attempt_limit'],record.get('manual_retry_limit',0))
+
+    def recover_selection(self,unit,problem):
+        """Checkpoint before handing control to a command-free operator prompt."""
+        if self.recovery_handler is None:
+            raise RetryLimitError(problem)
+        record=self.state['sections'][unit['id']]
+        reason=record.get('error') or problem
+        self.state.update(finished=False,audit_status='recovery_required',
+                          recovery={'unit':unit['id'],'reason':reason,'status':'waiting',
+                                    'after_attempts':len(record['attempts'])})
+        self.save()
+        action=self.recovery_handler(unit,reason)
+        decision={'action':action,'after_attempts':len(record['attempts']),
+                  'utc':datetime.now(timezone.utc).isoformat()}
+        if action=='retry':
+            record['manual_retry_limit']=len(record['attempts'])+1
+            decision['allowed_attempts']=self.section_attempt_limit(record)
+            self.state['recovery']['status']='retry_requested'
+        else:
+            self.state['recovery']['status']=action
+        record.setdefault('recovery_decisions',[]).append(decision)
+        self.save()
+        return action=='retry'
 
     @classmethod
     def create(cls, plan, plan_path, export_dir, server_log, player, directory=None,
@@ -425,12 +471,16 @@ class Run:
         force=self.console.command(f"/executeas {player} /chunk forceload {bounds['xmin']} {bounds['zmin']} {bounds['xmax']} {bounds['zmax']}",r'will force load \d+ chunk columns')
         self.console.command(f"/tp {player} {(bounds['xmin']+bounds['xmax'])//2} {bounds['ymax']-2} {(bounds['zmin']+bounds['zmax'])//2}",r'teleported')
         deadline=time.monotonic()+90
+        last_notice=time.monotonic()
         while True:
             queues=self.console.command(f'/executeas {player} /chunk cit',r'Chunk in genQ: (True|False), chunkReq in Q: (True|False)')
             if 'Chunk in genQ: False, chunkReq in Q: False' in queues:
                 return {'force_loaded':True,'queues_clear':True,'preload_response':force,'queue_response':queues}
             if time.monotonic()>=deadline:
                 raise CaptureError('Chunk queues did not settle')
+            if time.monotonic()-last_notice>=10:
+                print('  Still waiting for chunk loading queues to clear ...',flush=True)
+                last_notice=time.monotonic()
             time.sleep(1)
 
     def capture(self,unit,bounds,purpose,attempt):
@@ -438,8 +488,13 @@ class Run:
         path=self.export_dir/(name+'.json')
         if os.path.lexists(path):
             raise CaptureError('Refusing an existing export filename: '+str(path))
+        self.announce('Loading export area: force-load chunks, teleport player, and wait for chunk queues.',unit)
         loaded=self.load_area(bounds)
         player=self.state['source']['player']
+        purpose_label='primary selection' if purpose=='section' else 'deeper probe'
+        self.announce(f'Chunk load checks passed; selecting and exporting {purpose_label}.',unit)
+        if self.verbose:
+            print('    Export file: '+str(path),flush=True)
         self.console.command(f"/executeas {player} /we select {bounds['xmin']} {bounds['ymin']} {bounds['zmin']} {bounds['xmax']} {bounds['ymax']} {bounds['zmax']}",r'Start and end position marked')
         if os.path.lexists(path):
             raise CaptureError('Export name appeared before its command: '+str(path))
@@ -450,12 +505,15 @@ class Run:
         record.setdefault('issued_exports',[]).append(ref)
         self.save()
         self.console.command(f'/executeas {player} /we export {name}',r'\d+ blocks.*exported',120)
+        self.announce('Export acknowledged; waiting for a fresh file to stop changing.',unit)
         self.activity('Waiting for fresh stable export: '+name,unit)
         self.wait(path,issued)
         info=path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
                 or info.st_mtime_ns < issued or info.st_ctime_ns < issued):
             raise CaptureError('Export freshness check failed: '+path.name)
+        self.announce('File stable; recording its hash.',unit)
+        self.activity('Hashing export: '+name,unit)
         ref.update(sha256=digest_file(path),size=info.st_size,mtime_ns=info.st_mtime_ns,ctime_ns=info.st_ctime_ns)
         self.save()
         return ref
@@ -470,6 +528,7 @@ class Run:
         issued=self.state['sections'].get(ref['unit'],{}).get('issued_exports',[])
         if not any(item==ref for item in issued):
             raise CaptureError('Export was not issued by this run: '+name)
+        self.activity('Validating export: '+name,self.units[ref['unit']])
         path=self.export_dir/name
         info=path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
@@ -536,15 +595,17 @@ class Run:
                               'basis':'Direct anchor record and a record in every required vertical chunk stratum, or a matching fresh loaded deeper-column export.'}
 
     def capture_section(self,unit):
+        started=time.monotonic()
         record=self.state['sections'].setdefault(unit['id'],{'status':'pending','attempts':[]})
+        attempt_limit=self.section_attempt_limit(record)
         candidate=record.get('candidate')
         if candidate:
             attempt=candidate['attempt']
             if not record['attempts'] or record['attempts'][-1]['id']!=attempt or record['attempts'][-1]['status']!='capturing':
                 raise CaptureError('Partial candidate is not the active attempt')
         else:
-            if len(record['attempts'])>=self.state['attempt_limit']:
-                raise CaptureError('Retry limit reached for '+unit['id']+'; run remains incomplete')
+            if len(record['attempts'])>=attempt_limit:
+                raise RetryLimitError('Retry limit reached for '+unit['id']+'; run remains incomplete')
             attempt=uuid.uuid4().hex
             record['attempts'].append({'id':attempt,'status':'capturing'})
         record.update(status='waiting',selected=None,fingerprints={})
@@ -553,13 +614,15 @@ class Run:
         try:
             if candidate:
                 selected=candidate['selected']; probes=list(candidate['probes'])
-                print(f"Reusing immutable candidate for {unit['id']} and {len(probes)} same-attempt probes.",flush=True)
+                self.announce(f'Rechecking interrupted attempt: saved primary export and {len(probes)} saved deeper probes.',unit)
             else:
+                self.announce(f"Starting primary export attempt {len(record['attempts'])}/{attempt_limit}.",unit)
                 selected=self.capture(unit,unit['capture'],'section',attempt)
                 probes=[]
             if (selected['requested']!=unit['capture'] or selected['purpose']!='section'
                     or selected['unit']!=unit['id'] or selected['attempt']!=attempt):
                 raise CaptureError('Partial primary candidate does not match the active section attempt')
+            self.announce(f'Validating primary export and checking column evidence through Y={self.anchor(unit)}.',unit)
             data,evidence=self.read_ref(selected)
             if not data.get('Indices') and len(record['attempts'])==1:
                 raise CaptureError('Zero-block export; retry the entire loaded selection')
@@ -567,6 +630,8 @@ class Run:
             self.save()
             missing=columns_needing_confirmation(data,unit['capture'],self.anchor(unit))
             pending=set(missing)
+            if probes:
+                self.announce(f'Revalidating {len(probes)} saved deeper probes before planning any additional exports.',unit)
             for probe in probes:
                 pending-=self.check_probe(unit,selected,data,probe,pending)
             if pending:
@@ -577,34 +642,50 @@ class Run:
                 if self.state['settings']['probe_ymin']>=unit['capture']['ymin']:
                     raise CaptureError('Probe Y minimum must be below the selection floor')
                 planned=list(chunk_bounds(boxes,self.state['settings']['probe_ymin'],unit['capture']['ymax']))
-                print(f"{unit['id']}: {len(pending)} columns need deeper confirmation; {len(planned)} probes.",flush=True)
+                self.announce(f"Required evidence through Y={self.anchor(unit)} is missing for {count_label(len(pending),'column')}; "
+                              f"will load and export {count_label(len(planned),'deeper probe')} at "
+                              f"Y={self.state['settings']['probe_ymin']}..{unit['capture']['ymax']}.",unit)
                 for index,bounds in enumerate(planned,1):
-                    self.activity(f'Deeper confirmation {index}/{len(planned)}',unit)
+                    self.announce(f'Deeper probe {index}/{len(planned)}: {bounds_label(bounds)}.',unit)
                     ref=self.capture(unit,bounds,'depth',attempt)
-                    pending-=self.check_probe(unit,selected,data,ref,pending)
+                    self.announce(f'Validating deeper probe {index}/{len(planned)} and comparing '
+                                  f"Y={unit['capture']['ymin']}..{unit['capture']['ymax']} with the primary export.",unit)
+                    confirmed=self.check_probe(unit,selected,data,ref,pending)
+                    pending-=confirmed
                     probes.append(ref)
                     record['candidate']['probes']=probes
                     record['candidate']['unverified_columns']=len(pending)
                     self.save()
+                    self.announce(f"Deeper probe {index}/{len(planned)} confirmed {count_label(len(confirmed),'column')}; "
+                                  f'{len(pending)} still need confirmation. Checkpoint saved.',unit)
+            else:
+                self.announce('Column evidence is sufficient; no additional deeper probes needed.',unit)
+            self.announce('Checking the complete selection and its probes, then building overlap comparisons.',unit)
             data,evidence,coverage=self.check_section(unit,selected,probes)
             strips=section_fingerprints(data,unit['capture'],self.incident[unit['id']])
             record.update(status='complete',selected=selected,probes=probes,coverage=coverage,fingerprints=strips)
             record.pop('error',None)
             record.pop('candidate',None)
             record['attempts'][-1].update(status='validated',selected=selected,probes=probes)
+            if self.state.get('recovery',{}).get('unit')==unit['id']:
+                self.state['recovery']['status']='capture_validated'
             self.save()
+            self.announce(f"Selection {unit['index']}/{len(self.units)} captured: primary export and {count_label(len(probes),'deeper probe')} validated; "
+                          f'checkpoint saved ({time.monotonic()-started:.1f}s).',unit)
             return True
         except CompatibilityError as exc:
             record.update(status='incomplete',error=str(exc),selected=None)
             record['attempts'][-1].update(status='review_required',error=str(exc))
             self.save()
+            self.announce(f"Attempt {len(record['attempts'])}/{attempt_limit} stopped for compatibility review: {exc}",unit)
             raise
-        except (CaptureError,OSError,ValueError,TimeoutError) as exc:
+        except (CaptureError,OSError,ValueError,TimeoutError,RuntimeError,subprocess.SubprocessError) as exc:
             record.pop('candidate',None)
             record.update(status='incomplete',error=str(exc),selected=None)
             record['attempts'][-1].update(status='failed',error=str(exc))
             self.save()
-            print(f"{unit['id']}: {exc}",flush=True)
+            self.announce(f"Attempt {len(record['attempts'])}/{attempt_limit} failed: {exc}. "
+                          'The whole selection remains incomplete.',unit)
             return False
 
     def seams(self):
@@ -630,12 +711,19 @@ class Run:
                                                canonical_map(b,right['requested'],pair['bounds']))}
 
     def audit(self):
+        selected=sum(bool(self.state['sections'].get(name,{}).get('selected')) for name in self.units)
+        if selected:
+            self.announce(f'Final audit: rechecking {selected} selected exports and their probes, '
+                          f'then verifying {len(self.pairs)} overlaps and exact requested coverage.')
+        else:
+            self.announce(f'Final audit: no validated primary exports are selected; '
+                          f'checking missing coverage for {len(self.units)} selections.')
         self.state.update(audit_status='running',coverage_complete=None,overlap_complete=None,files_verified=None,finished=False)
         self.save()
         covered,formal,files,errors,warnings=[],[],[],[],[]
         for index,unit in enumerate(self.state['units'],1):
             self.activity(f'Auditing selection {index}/{len(self.units)}',unit)
-            if index==1 or index%10==0 or index==len(self.units):
+            if self.verbose or index==1 or index%10==0 or index==len(self.units):
                 print(f"Auditing run selection {index}/{len(self.units)}: {unit['id']}",flush=True)
             record=self.state['sections'].get(unit['id'],{})
             try:
@@ -657,6 +745,7 @@ class Run:
                 errors.append({'unit':unit['id'],'problem':str(exc),'selected':record.get('selected'),
                                'candidate':record.get('candidate')})
                 record.update(status='incomplete',error=str(exc),fingerprints={})
+        self.announce(f'Final audit: comparing {len(self.pairs)} overlap strips and computing exact coverage gaps.')
         checks=self.seams()
         checks=[self.seam_detail(check) if check['status']=='mismatch' else check for check in checks]
         required=[{**bounds,'ymax':max(bounds['ymin'],min(bounds['ymax'],self.state['settings']['coverage_y']))} for bounds in self.plan['requests']]
@@ -678,6 +767,7 @@ class Run:
         self.state['full_3d_coverage_complete']=not formal_gaps
         report['finished']=bool(not gaps and overlaps_ok and not errors and all(
             self.state['sections'].get(name,{}).get('status')=='complete' for name in self.units))
+        self.announce('Writing the audit report, preview, and final checkpoint.')
         self.preview()
         atomic_json(self.directory/(self.state['run_id']+'-audit.json'),report)
         self.state['audit_status']='complete'
@@ -696,40 +786,72 @@ class Run:
                           coverage_complete=None,column_coverage_complete=None,overlap_complete=None)
         self.save()
         queue=deque(self.units)
-        print(f"Checking {len(self.units)} selections from compatible run {self.state['run_id']} for reuse.",flush=True)
-        last_progress=time.monotonic()
+        saved=sum(bool(self.state['sections'].get(name,{}).get('selected')) for name in self.units)
+        interrupted=sum(bool(self.state['sections'].get(name,{}).get('candidate'))
+                        and not self.state['sections'].get(name,{}).get('selected') for name in self.units)
+        if saved or interrupted:
+            print(f'Continuing capture: {saved} saved selections to revalidate, {interrupted} interrupted attempts to check, '
+                  f'{len(self.units)-saved-interrupted} selections awaiting capture.',flush=True)
+            print('Plan: revalidate saved evidence; capture only unfinished or invalid selections, '
+                  'confirm missing column evidence with loaded deeper probes, compare overlaps, then run the final audit.',flush=True)
+        else:
+            print(f'Starting capture of {len(self.units)} selections; no saved exports to revalidate.',flush=True)
+            print('Plan: load each area, export and validate it, use deeper probes where column evidence is missing, '
+                  'compare neighboring overlaps, then run the final audit.',flush=True)
         while True:
             while queue:
                 name=queue.popleft(); unit=self.units[name]
                 record=self.state['sections'].get(name,{})
-                self.activity('Checking run selection',unit)
                 if record.get('selected'):
-                    self.activity('Checking saved export: '+record['selected']['file'],unit)
-                    now=time.monotonic()
-                    if self.verbose or unit['index']==1 or unit['index']%10==0 or now-last_progress>=5:
-                        print(f"Checking saved run selection {unit['index']}/{len(self.units)}: {name}",flush=True)
-                        last_progress=now
+                    started=time.monotonic()
+                    self.announce(f"Selection {unit['index']}/{len(self.units)}: revalidating saved primary export and "
+                                  f"{len(record.get('probes',[]))} deeper probes before reuse.",unit)
+                    if self.verbose:
+                        print('    Saved export: '+record['selected']['file'],flush=True)
                     try:
                         self.check_section(unit,record['selected'],record.get('probes',[]))
+                        self.announce(f"Selection {unit['index']}/{len(self.units)} reused: saved exports validated; "
+                                      f'no new export needed ({time.monotonic()-started:.1f}s).',unit)
                         continue
                     except CompatibilityError:
                         raise
                     except (CaptureError,OSError,ValueError) as exc:
                         print(f"Cannot reuse {name}: {exc}. Keeping its old attempt and recapturing the whole selection.",flush=True)
                         record.update(selected=None,status='incomplete')
-                print(f"Selection {unit['index']}/{len(self.units)}: {unit['core']}",flush=True)
+                print(f"Selection {unit['index']}/{len(self.units)}: {bounds_label(unit['capture'])}; "
+                      f"includes {self.state['settings']['overlap']}-block overlap.",flush=True)
+                self.activity('Preparing primary capture',unit)
+                if self.verbose:
+                    print('  Nonoverlapping core: '+bounds_label(unit['core']),flush=True)
                 if confirm:
                     if input('Return to capture; q to stop: ').strip().lower()=='q':
                         return 130
-                if not self.capture_section(unit):
+                try:
+                    captured=self.capture_section(unit)
+                except RetryLimitError as exc:
+                    if not self.recover_selection(unit,str(exc)):
+                        print(f'Stopped with selection {unit["index"]}/{len(self.units)} incomplete. '
+                              f'Progress saved: {self.path}',flush=True)
+                        return 1
                     queue.appendleft(name)
                     continue
-                conflicts=[pair for pair in self.seams() if pair['status']=='mismatch' and name in (pair['left'],pair['right'])]
+                if not captured:
+                    queue.appendleft(name)
+                    continue
+                self.announce('Comparing overlap strips with available neighboring exports.',unit)
+                neighbors=[pair for pair in self.seams() if name in (pair['left'],pair['right'])]
+                conflicts=[pair for pair in neighbors if pair['status']=='mismatch']
+                matches=sum(pair['status']=='match' for pair in neighbors)
+                pending=sum(pair['status']=='pending' for pair in neighbors)
+                self.announce(f'Neighbor overlaps: {matches} match, {pending} awaiting neighboring captures, '
+                              f'{len(conflicts)} mismatch.',unit)
                 for pair in conflicts:
                     other=pair['right'] if pair['left']==name else pair['left']
+                    self.announce(f"Overlap mismatch {pair['id']}; recording the differences, then requesting "
+                                  f'a fresh whole export of {other}.',unit)
                     self.state.setdefault('seam_failures',[]).append(self.seam_detail(pair))
-                    print(f"Overlap mismatch {pair['id']}; requesting a fresh whole export of {other}.",flush=True)
-                    self.state['sections'][other].update(selected=None,status='incomplete')
+                    self.state['sections'][other].update(selected=None,status='incomplete',
+                                                        error=f"Overlap mismatch {pair['id']}")
                     if other not in queue:
                         queue.appendleft(other)
                     self.save()
@@ -740,6 +862,7 @@ class Run:
             for pair in report['overlap_checks']:
                 if pair['status']=='mismatch':
                     affected.add(pair['left'])
+                    self.state['sections'][pair['left']]['error']=f"Final audit overlap mismatch {pair['id']}"
             if not affected:
                 raise CaptureError('Run failed coverage or overlap validation')
             for name in sorted(affected):

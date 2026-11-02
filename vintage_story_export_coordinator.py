@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -28,6 +29,7 @@ import capture_run
 
 DEFAULT_PLAN = Path(__file__).resolve().parent / "capture-plans" / "coastal-connection" / "plan.json"
 DEFAULT_PLAYER = "Xplosionist"
+DEFAULT_RECOVERY_TIMEOUT = 300
 
 
 @dataclass(frozen=True)
@@ -166,6 +168,56 @@ def print_status_help() -> None:
         print(f"Immediate status: kill -USR1 {os.getpid()} (this system has no Ctrl-T/SIGINFO).", flush=True)
 
 
+def recovery_prompt(run,unit,problem,timeout):
+    """Wait without sending commands; timeout/EOF/quit preserve incomplete work."""
+    report_activity('Paused for investigation and a recovery decision',
+                    Cuboid(unit['index'],**unit['capture'],name=unit['id']))
+    print(f"\nSelection {unit['index']}/{len(run.units)} needs investigation.",flush=True)
+    print('Export area: '+capture_run.bounds_label(unit['capture']),flush=True)
+    print('Last problem: '+problem,flush=True)
+    record=run.state['sections'][unit['id']]
+    print(f"Attempts used: {len(record['attempts'])}; current limit for this selection: {run.section_attempt_limit(record)}.",flush=True)
+    print(f'Progress saved: {run.path}',flush=True)
+    if not sys.stdin.isatty():
+        print('No interactive terminal input; stopping with progress saved. Rerun interactively to investigate/retry.',flush=True)
+        return 'unattended'
+    print('No server commands will be sent while paused. You may fly around or investigate the server.\n'
+          'Retry authorizes ONE additional whole-selection attempt, including force-loading and teleporting again.',flush=True)
+    if timeout:
+        print(f'No response for {timeout}s saves and quits; w restarts that timer.',flush=True)
+    else:
+        print('Waiting indefinitely for your choice (--recovery-timeout 0).',flush=True)
+    deadline=time.monotonic()+timeout if timeout else None
+    while True:
+        try:
+            print('[r]etry once, [w]ait longer, [q]save and quit: ',end='',flush=True)
+            if deadline is not None:
+                remaining=deadline-time.monotonic()
+                if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]:
+                    print('\nRecovery wait timed out; stopping with progress saved.',flush=True)
+                    return 'timed_out'
+            line=sys.stdin.readline()
+            if not line:
+                print('\nInput closed; stopping with progress saved.',flush=True)
+                return 'quit'
+            choice=line.strip().lower()
+            if choice=='r':
+                return 'retry'
+            if choice=='q':
+                return 'quit'
+            if choice=='w':
+                deadline=time.monotonic()+timeout if timeout else None
+                print('Investigation wait extended; no server commands sent.',flush=True)
+            else:
+                print('Choose r, w, or q; the existing timeout still applies.',flush=True)
+        except KeyboardInterrupt:
+            print('\nStopping with progress saved.',flush=True)
+            return 'quit'
+        except (OSError,ValueError) as exc:
+            print(f'\nCannot read recovery input: {exc}. Stopping with progress saved.',flush=True)
+            return 'quit'
+
+
 def choose_compatible_run(runs,blocked,*,allow_new=True):
     if len(runs)==1:
         run=runs[0]
@@ -224,6 +276,9 @@ def build_parser() -> argparse.ArgumentParser:
   --new-run cannot be combined with --resume, --preview, or --report-coverage;
   with --run-dir it requires a nonexistent or completely empty directory.
   --report-coverage requires an existing compatible run.
+  Exhausted automatic attempts pause for investigation on an interactive
+  terminal: r authorizes one extra attempt, w extends the wait, q saves/quits.
+  Timeout or noninteractive input stops with incomplete progress saved.
 
 Continuation and defaults:
   Without an explicit run directory, continue the compatible run matching
@@ -285,15 +340,17 @@ Examples:
     policy.add_argument('--coverage-y',type=int,metavar='Y',
         help=f"required surface/column confirmation height, nonnegative and clamped to each selection's Y range (new-run default: {capture_run.DEFAULT_COVERAGE_Y}); does not change exported Y bounds")
     policy.add_argument('--max-attempts',type=int,metavar='N',
-        help=f'total whole-section attempt limit per selection, including previous attempts, N >= 1 (new-run default: {capture_run.DEFAULT_MAX_ATTEMPTS}); continuing runs may only raise it')
+        help=f'automatic whole-section attempt ceiling per selection, including previous attempts, N >= 1 (new-run default: {capture_run.DEFAULT_MAX_ATTEMPTS}); continuing runs may only raise it; recovery prompt can authorize one additional attempt')
     policy.add_argument('--rescan-y-min',type=int,metavar='Y',
         help=f'nonnegative floor for automatic deeper confirmation probes (new-run default: {capture_run.DEFAULT_PROBE_YMIN}); when needed, probes must start below the selection floor and fit selection limits')
 
     interaction=parser.add_argument_group('collection output and interaction')
     interaction.add_argument('--verbose',action='store_true',
-        help='show every saved-selection reuse check during collection instead of periodic summaries (default: off)')
+        help='include export filenames, original core bounds, and every final-audit selection in progress output (default: off); normal output already describes capture stages and results')
     interaction.add_argument('--step-by-step',action='store_true',
         help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; unused for preview/preparation/reporting (default: off)')
+    interaction.add_argument('--recovery-timeout',type=int,default=DEFAULT_RECOVERY_TIMEOUT,metavar='SECONDS',
+        help=f'wait for a recovery decision after automatic attempts are exhausted (default: {DEFAULT_RECOVERY_TIMEOUT}s); 0 waits indefinitely; timeout saves and stops, noninteractive input stops immediately; collection only')
     return parser
 
 
@@ -304,7 +361,8 @@ def _main(status_reporter: RunStatus) -> int:
             ('--overlap',args.overlap,1,16),
             ('--coverage-y',args.coverage_y,0,None),
             ('--max-attempts',args.max_attempts,1,None),
-            ('--rescan-y-min',args.rescan_y_min,0,None)):
+            ('--rescan-y-min',args.rescan_y_min,0,None),
+            ('--recovery-timeout',args.recovery_timeout,0,None)):
         if value is not None and (value<minimum or (maximum is not None and value>maximum)):
             constraint=f'{minimum}..{maximum}' if maximum is not None else f'>= {minimum}'
             parser.error(f'{option} must be {constraint}')
@@ -370,9 +428,11 @@ def _main(status_reporter: RunStatus) -> int:
         parser.error(str(exc))
     status_reporter.configure([Cuboid(unit['index'],**unit['core'],name=unit['id']) for unit in run.state['units']],run.state)
     def activity(description,unit=None):
-        report_activity(description,Cuboid(unit['index'],**unit['capture'],name=unit['id']) if unit else None)
+        report_activity(description,Cuboid(unit['index'],**unit['capture'],name=unit['id']) if unit else None,
+                        clear_region=unit is None)
     run.activity=activity
     run.verbose=args.verbose
+    run.recovery_handler=lambda unit,problem:recovery_prompt(run,unit,problem,args.recovery_timeout)
     print(f"Operational model: {run.state['operational_model']} ({capture_run.SCHEMA})",flush=True)
     print(f"Export prefix: {run.state['prefix']}",flush=True)
     print(f"Run ID: {run.state['run_id']}\nPlan SHA256: {run.plan['plan_hash']}\nRun directory: {run.directory}\nProgress: {run.path}",flush=True)
@@ -385,7 +445,7 @@ def _main(status_reporter: RunStatus) -> int:
             parser.error('Saved run server log/export directory is unavailable')
         binary=str(args.tmux_binary.expanduser().resolve()) if args.tmux_binary else 'tmux'
         run.console=server_console.Console(binary,args.target_pane,Path(run.state['source']['server_log']),
-            run.directory/'commands',paste_commands,activity=lambda description:activity(description))
+            run.directory/'commands',paste_commands,activity=report_activity)
     original_handler=signal.getsignal(signal.SIGINT)
     try:
         with run.locked():

@@ -35,7 +35,8 @@ class CliTests(unittest.TestCase):
                          './capture-runs/RUN_ID','capture-plans/coastal-connection/plan.json',
                          'existing runs use their frozen plan','saved values when continuing',
                          'mutually exclusive','does not change exported Y bounds',
-                         'VS_CAPTURE_RUN_INDEX'):
+                         'VS_CAPTURE_RUN_INDEX','--recovery-timeout','default: 300s',
+                         'noninteractive input stops immediately'):
             self.assertIn(expected,text)
         for option,value in (('--overlap',c.capture_run.DEFAULT_OVERLAP),
                              ('--coverage-y',c.capture_run.DEFAULT_COVERAGE_Y),
@@ -70,7 +71,7 @@ class CliTests(unittest.TestCase):
 
     def test_numeric_bounds_are_checked_before_prompts_and_run_creation(self):
         for option,value in (('--overlap','0'),('--overlap','17'),('--max-attempts','0'),
-                             ('--coverage-y','-1'),('--rescan-y-min','-1')):
+                             ('--coverage-y','-1'),('--rescan-y-min','-1'),('--recovery-timeout','-1')):
             with self.subTest(option=option,value=value):
                 self.rejected(['--prepare-only',option,value],option+' must be')
         self.rejected(['--prepare-only','--overlap','1.5'],'invalid int value')

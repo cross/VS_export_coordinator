@@ -113,6 +113,23 @@ class AutoResumeTests(unittest.TestCase):
                 self.assertEqual(stopped.exception.code,2)
                 self.assertEqual(list(directory.iterdir()),[])
 
+    def test_cli_exhausted_run_stops_without_commands_when_input_is_noninteractive(self):
+        run=self.prepare(self.root/'exhausted')
+        unit=run.state['units'][0]
+        run.state['sections'][unit['id']]={'status':'incomplete','selected':None,
+            'error':'Chunk queues did not settle',
+            'attempts':[{'id':str(index),'status':'failed'} for index in range(3)]}
+        run.save()
+        with patch('sys.stdin',new=io.StringIO()):
+            result,output=self.invoke(['--resume',str(run.directory),'--target-pane','%1'])
+        self.assertEqual(result,1)
+        self.assertIn('No interactive terminal input',output)
+        checkpoint=p.read_json(run.path)
+        self.assertEqual(checkpoint['recovery']['status'],'unattended')
+        self.assertEqual(checkpoint['recovery']['reason'],'Chunk queues did not settle')
+        self.assertFalse(checkpoint['finished'])
+        self.assertEqual(len(checkpoint['sections'][unit['id']]['attempts']),3)
+
     def test_unindexed_local_manifest_is_discovered_and_registered(self):
         directory=self.source.parent/'planA-run'
         original=runs.Run.create(self.plan,self.source,self.exports,self.log,'Player',directory=directory,coverage_y=66)

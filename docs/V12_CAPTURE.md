@@ -90,8 +90,9 @@ python3 -B /path/to/vintage_story_export_coordinator.py \
 
 The run retains the player, actual export directory, and server-log path.
 `--tmux-binary /path/to/tmux` can be supplied on either collection command.
-Use `--verbose` for per-selection resume checks and `--step-by-step` to confirm
-primary captures. A report needs no pane and sends no commands. `--plan PLAN
+Use `--verbose` to include export filenames, original core bounds, and every
+final-audit selection, and `--step-by-step` to confirm primary captures.
+A report needs no pane and sends no commands. `--plan PLAN
 --report-coverage` also discovers and audits a compatible run automatically.
 If none is found, reporting stops with an error; loose export files are never
 adopted by filename. Plan-only `--preview` renders the planned cores; use
@@ -164,6 +165,37 @@ it with `--max-attempts N` on resume preserves compatible evidence; changing
 the retry budget does not relax the validation rules. Changes to `--overlap`,
 `--coverage-y`, or `--rescan-y-min` require a new run definition.
 
+### Investigation after automatic retries
+
+After the automatic attempt budget is exhausted, an interactive collection
+saves its checkpoint and pauses. It prints the affected selection's actual
+export bounds, attempts used, last failure reason, and progress path. While
+paused, it sends no server commands, so you may fly around to load chunks or
+investigate the server before deciding what to do.
+
+The recovery prompt offers:
+
+- `r`: authorize one additional fresh whole-selection attempt. It performs
+  force-loading, teleporting, chunk-queue checks, and normal validation again.
+- `w`: extend the investigation time by restarting the response timer.
+- `q`: save and quit with the selection incomplete.
+
+The default response timeout is **300 seconds**. Set `--recovery-timeout SECONDS`
+to change it, or `--recovery-timeout 0` to wait indefinitely. Invalid input does
+not extend the timer. Timeout, end of input, or Ctrl-C at this prompt stops
+with progress saved. Without interactive terminal input, collection stops
+immediately instead of waiting. Stopping on an unresolved selection returns
+exit status 1. Restarting the same command brings that selection back to the
+recovery prompt if its budget is still exhausted; a higher `--max-attempts`
+can instead authorize more automatic attempts.
+
+Manual retry permission applies only to the affected selection, is recorded
+in its checkpoint, and survives a restart. It does not reset attempt history,
+increase other selections' budgets, or accept a failed export. If that one
+extra attempt fails, the program returns to the recovery prompt. There is no
+split, skip, or manual-accept choice in this menu. Compatibility errors and
+failures to save checkpoints still stop collection for review.
+
 ### Loading, fresh files, and whole-section replacement
 
 Every export, including the first section and every probe, requests force-load
@@ -213,7 +245,8 @@ retained in raw files but are not part of the terrain seam comparison.
 
 A mismatch blocks completion and requests a fresh whole export of an affected
 section. Neighbor checks are repeated against its replacement. Persistent
-differences stop at the retry limit with `finished: false`. The final audit
+differences reach the recovery prompt at the retry limit with `finished: false`;
+timeout or noninteractive operation stops with progress saved. The final audit
 rechecks the selected files and probes and recomputes overlap fingerprints.
 It records every overlap's bounds, source filenames/hashes, and comparison
 digests; mismatches include differing-position counts and sample multisets.
@@ -275,12 +308,27 @@ separate run; changing the tmux pane is permitted. Reports need a matching run
 manifest and send no server commands. `--resume RUN_DIRECTORY` explicitly
 selects a run for collection, preview, or audit.
 
-The startup banner identifies the run, progress file, and preview. Before
-reusing a selected export, collection revalidates its exact file hash, bounds,
-loading evidence, column coverage, and deeper confirmations. It announces this
-work before reading the files and reports selection progress periodically
-(every selection with `--verbose`). Large exports can take time to parse; the
-status signal identifies the file being checked.
+The startup banner identifies the run, progress file, and preview. A fresh run
+says there are no saved exports to revalidate and describes the capture steps.
+Only runs with saved primary exports or interrupted candidates announce checks
+for reuse. Before reusing a selected export, collection revalidates its exact
+file hash, bounds, loading evidence, column coverage, and deeper confirmations.
+Each saved selection gets a validation message before its files are read and
+a result afterward. Large exports can take time to parse; the status signal
+identifies the exact file being checked.
+
+Normal output announces the work before it starts: loading chunks and
+teleporting, selecting/exporting, waiting for file stability, hashing, column
+validation, deeper probes, neighbor comparisons, and the final audit.
+Selection headers show actual exported bounds and dimensions, including overlap;
+`--verbose` additionally shows the nonoverlapping core. When deeper evidence is
+needed, the output gives the column count, number of planned probes, and their
+Y range. Each probe reports its bounds, validation, confirmed columns, remaining
+columns, and saved checkpoint. Each selection ends with a captured/reused result
+and elapsed time; a failed attempt is reported before the whole selection is
+retried. Captured selections still require overlap checks and the final audit
+before the run is certified complete. These are reporting changes and do not
+change run compatibility or capture policy.
 
 The collector has no `--prefix` or `--z-span` option. Change geometry, height,
 and section sizes with `v12_capture_plan.py`, review the resulting plan, then

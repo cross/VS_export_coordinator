@@ -103,6 +103,81 @@ class RunTests(unittest.TestCase):
         self.assertFalse(console.commands)
         self.assertTrue(restored.state['finished'])
 
+    def test_fresh_capture_announces_work_before_commands_and_file_waits(self):
+        run=self.create(); console=FakeConsole(self.exports); run.console=console
+        output=io.StringIO(); counts={'loading':0,'exporting':0,'waiting':0}
+        command=console.command; wait=run.wait
+        def observed_command(text,*args,**kwargs):
+            if '/chunk forceload ' in text:
+                counts['loading']+=1
+                self.assertEqual(output.getvalue().count('Loading export area:'),counts['loading'])
+            if '/we export ' in text:
+                counts['exporting']+=1
+                self.assertEqual(output.getvalue().count('Chunk load checks passed; selecting and exporting primary selection.'),counts['exporting'])
+            return command(text,*args,**kwargs)
+        def observed_wait(path,issued):
+            counts['waiting']+=1
+            self.assertEqual(output.getvalue().count('Export acknowledged; waiting for a fresh file to stop changing.'),counts['waiting'])
+            return wait(path,issued)
+        console.command=observed_command; run.wait=observed_wait
+        with patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        self.assertIn('Starting capture of 2 selections; no saved exports to revalidate.',text)
+        self.assertNotIn('for reuse',text)
+        self.assertNotIn('revalidating saved primary',text)
+        self.assertIn('Selection 1/2: X 0..4, Y 65..67, Z 0..4 (5×3×5 blocks); includes 3-block overlap.',text)
+        self.assertIn('no additional deeper probes needed',text)
+        self.assertLess(text.index('Selection 1/2 captured:'),text.index('Selection 2/2:'))
+        self.assertIn('checkpoint saved',text)
+        self.assertIn('Neighbor overlaps: 1 match',text)
+        self.assertLess(text.index('Final audit: rechecking'),text.index('Auditing run selection 1/2'))
+
+    def test_deeper_probe_plan_and_confirmation_progress_are_visible(self):
+        run=self.create(); run.console=FakeConsole(self.exports,shafts={(0,0)})
+        output=io.StringIO(); check=run.check_probe; observed=[]
+        def observed_check(unit,selected,data,probe,pending):
+            if not observed:
+                self.assertIn('will load and export 1 deeper probe at Y=0..67',output.getvalue())
+                self.assertIn('Deeper probe 1/1: X 0..31, Y 0..67, Z 0..31',output.getvalue())
+                self.assertIn('Validating deeper probe 1/1 and comparing',output.getvalue())
+                self.assertNotIn('Deeper probe 1/1 confirmed',output.getvalue())
+            observed.append(probe['file'])
+            return check(unit,selected,data,probe,pending)
+        with patch.object(run,'check_probe',side_effect=observed_check), patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        self.assertIn('Deeper probe 1/1 confirmed 1 column; 0 still need confirmation. Checkpoint saved.',text)
+        self.assertIn('Selection 1/2 captured: primary export and 1 deeper probe validated',text)
+        self.assertTrue(observed)
+
+    def test_reused_exports_are_announced_and_do_not_send_new_commands(self):
+        run=self.create(); self.assertEqual(self.collect(run),0)
+        restored=runmod.Run.resume(run.directory)
+        restored.console=FakeConsole(self.exports)
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(restored.collect(),0)
+        text=output.getvalue()
+        self.assertIn('2 saved selections to revalidate, 0 interrupted attempts',text)
+        self.assertIn('Plan: revalidate saved evidence; capture only unfinished or invalid selections',text)
+        self.assertNotIn('Plan: load each area',text)
+        self.assertIn('Selection 1/2: revalidating saved primary export',text)
+        self.assertIn('Selection 1/2 reused: saved exports validated; no new export needed',text)
+        self.assertNotIn('Loading export area:',text)
+        self.assertFalse(restored.console.commands)
+
+    def test_failed_attempt_is_reported_before_whole_selection_retry(self):
+        run=self.create(); run.console=FakeConsole(self.exports,partial_first=True)
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        self.assertIn('Attempt 1/3 failed:',text)
+        self.assertIn('The whole selection remains incomplete.',text)
+        self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Starting primary export attempt 2/3.'))
+        self.assertLess(text.index('Starting primary export attempt 2/3.'),text.index('Selection 1/2 captured:'))
+
     def test_partial_run_resumes_completed_selection_without_recapturing_it(self):
         run=self.create(); run.console=FakeConsole(self.exports)
         with patch('sys.stdout',new=io.StringIO()):
@@ -354,6 +429,80 @@ class RunTests(unittest.TestCase):
         self.assertTrue(run.state['seam_failures'])
         self.assertGreater(run.state['seam_failures'][0]['difference']['positions'],0)
         self.assertTrue(all(len(record['attempts'])<=3 for record in run.state['sections'].values()))
+
+    def test_recovery_prompt_is_checkpointed_and_retry_only_extends_failed_selection(self):
+        run=self.create(); console=FakeConsole(self.exports,unit_codes={'s00001':2,'s00002':1})
+        prompts=[]
+        def recover(unit,problem):
+            snapshot=p.read_json(run.path)
+            self.assertFalse(snapshot['finished'])
+            self.assertEqual(snapshot['audit_status'],'recovery_required')
+            self.assertEqual(snapshot['recovery']['status'],'waiting')
+            self.assertEqual(snapshot['recovery']['unit'],unit['id'])
+            self.assertIn('Overlap mismatch',problem)
+            self.assertEqual(len(snapshot['sections'][unit['id']]['attempts']),3)
+            prompts.append(unit['id'])
+            console.unit_codes['s00001']=1  # Simulate the operator resolving the server condition.
+            return 'retry'
+        run.recovery_handler=recover
+        self.assertEqual(self.collect(run,console),0)
+        self.assertEqual(prompts,['s00001'])
+        self.assertEqual(console.counts,{'s00001':4,'s00002':3})
+        self.assertEqual(run.state['attempt_limit'],3)
+        record=run.state['sections']['s00001']
+        self.assertEqual(record['manual_retry_limit'],4)
+        self.assertEqual(record['recovery_decisions'][0]['action'],'retry')
+        self.assertTrue(run.state['finished'])
+        self.assertEqual(run.state['recovery']['status'],'capture_validated')
+        restored=runmod.Run.resume(run.directory)
+        self.assertEqual(restored.state['sections']['s00001']['manual_retry_limit'],4)
+        reused=FakeConsole(self.exports)
+        self.assertEqual(self.collect(restored,reused),0)
+        self.assertFalse(reused.commands)
+
+    def test_manual_retry_grants_one_attempt_then_returns_to_prompt(self):
+        run=self.create(); console=FakeConsole(self.exports)
+        def unloaded(*args,**kwargs):
+            raise RuntimeError('Chunk load failed')
+        console.command=unloaded
+        prompts=[]
+        def recover(unit,problem):
+            prompts.append(len(run.state['sections'][unit['id']]['attempts']))
+            return 'retry' if len(prompts)==1 else 'quit'
+        run.recovery_handler=recover
+        self.assertEqual(self.collect(run,console),1)
+        self.assertEqual(prompts,[3,4])
+        self.assertEqual(len(run.state['sections']['s00001']['attempts']),4)
+        self.assertNotIn('s00002',run.state['sections'])
+        self.assertFalse(run.state['finished'])
+        self.assertEqual(run.state['recovery']['status'],'quit')
+
+    def test_timeout_and_unattended_decisions_stop_without_more_exports(self):
+        for action in ('timed_out','unattended'):
+            with self.subTest(action=action):
+                run=self.create(action); console=FakeConsole(self.exports,unit_codes={'s00001':2,'s00002':1})
+                run.recovery_handler=lambda unit,problem:action
+                self.assertEqual(self.collect(run,console),1)
+                checkpoint=p.read_json(run.path)
+                self.assertFalse(checkpoint['finished'])
+                self.assertEqual(checkpoint['recovery']['status'],action)
+                self.assertEqual(checkpoint['sections']['s00001']['status'],'incomplete')
+                self.assertEqual(len(checkpoint['sections']['s00001']['attempts']),3)
+                self.assertNotIn('manual_retry_limit',checkpoint['sections']['s00001'])
+
+    def test_server_command_errors_are_retryable_and_reach_recovery_prompt(self):
+        run=self.create(); console=FakeConsole(self.exports)
+        def rejected(*args,**kwargs):
+            raise RuntimeError('No such player')
+        console.command=rejected
+        reasons=[]
+        def recover(unit,problem):
+            reasons.append(problem); return 'quit'
+        run.recovery_handler=recover
+        self.assertEqual(self.collect(run,console),1)
+        self.assertEqual(reasons,['No such player'])
+        self.assertEqual(len(run.state['sections']['s00001']['attempts']),3)
+        self.assertFalse(list(self.exports.glob('*.json')))
 
     def test_final_audit_recomputes_overlap_fingerprints_instead_of_trusting_cache(self):
         run=self.create(); self.assertEqual(self.collect(run),0)
