@@ -90,8 +90,10 @@ python3 -B /path/to/vintage_story_export_coordinator.py \
 
 The run retains the player, actual export directory, and server-log path.
 `--tmux-binary /path/to/tmux` can be supplied on either collection command.
-Use `--verbose` to include export filenames, original core bounds, and every
-final-audit selection, and `--step-by-step` to confirm primary captures.
+Use `--verbose` for one progress line per completed deeper probe, saved-export
+filenames during reuse checks, primary/probe counts in completion summaries,
+successful overlap comparisons, and every final-audit selection. Use
+`--step-by-step` to confirm primary captures.
 A report needs no pane and sends no commands. `--plan PLAN
 --report-coverage` also discovers and audits a compatible run automatically.
 If none is found, reporting stops with an error; loose export files are never
@@ -317,18 +319,33 @@ Each saved selection gets a validation message before its files are read and
 a result afterward. Large exports can take time to parse; the status signal
 identifies the exact file being checked.
 
-Normal output announces the work before it starts: loading chunks and
-teleporting, selecting/exporting, waiting for file stability, hashing, column
-validation, deeper probes, neighbor comparisons, and the final audit.
-Selection headers show actual exported bounds and dimensions, including overlap;
-`--verbose` additionally shows the nonoverlapping core. When deeper evidence is
-needed, the output gives the column count, number of planned probes, and their
-Y range. Each probe reports its bounds, validation, confirmed columns, remaining
-columns, and saved checkpoint. Each selection ends with a captured/reused result
-and elapsed time; a failed attempt is reported before the whole selection is
-retried. Captured selections still require overlap checks and the final audit
-before the run is certified complete. These are reporting changes and do not
-change run compatibility or capture policy.
+Normal capture output is limited to useful milestones: one set of actual
+selection bounds and dimensions (with an overlap note), any deeper-confirmation
+plan, and a saved result with elapsed time. Before the first export starts, a
+short "Exporting primary selection ..." line announces the work, including
+chunk loading and teleporting. Its result follows after processing: either the
+deeper-confirmation plan or the saved completion result. Attempt numbers and
+reload details appear only when another attempt becomes necessary. There
+are no separate success messages for chunk queues, file stability, hashing,
+each validation phase, original core bounds, or newly generated export paths.
+Those detailed phases still update the immediate status signal; filenames and
+bounds also remain in the saved run records and command files.
+
+When deeper evidence is needed, one line gives the column count, planned probe
+count, loading/teleport/export actions, and Y range. Normal output samples probe
+progress after about 15 seconds between completed probes. `--verbose` prints
+exactly one short result for every successful completed probe. For three probes,
+a successful verbose selection normally occupies seven lines, plus at most one
+useful overlap summary. Verbose completion summaries retain the primary-export
+and deeper-probe counts; normal summaries use the shorter validated/saved result.
+Only `--verbose` reports successful overlap comparisons, explaining agreement
+of shared block records with neighboring exports and which remaining checks
+need neighboring captures. There is no summary if no neighboring export could
+actually be compared. Overlap mismatches remain visible in both modes.
+Failures, retries, prolonged chunk-queue waits, and recovery prompts remain
+visible in either mode. Captured selections still require overlap checks and
+the final audit before the run is certified complete. These reporting choices
+do not change run compatibility or capture policy.
 
 The collector has no `--prefix` or `--z-span` option. Change geometry, height,
 and section sizes with `v12_capture_plan.py`, review the resulting plan, then

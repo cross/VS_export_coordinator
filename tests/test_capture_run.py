@@ -105,19 +105,21 @@ class RunTests(unittest.TestCase):
 
     def test_fresh_capture_announces_work_before_commands_and_file_waits(self):
         run=self.create(); console=FakeConsole(self.exports); run.console=console
+        activities=[]; run.activity=lambda description,unit=None:activities.append(description)
         output=io.StringIO(); counts={'loading':0,'exporting':0,'waiting':0}
         command=console.command; wait=run.wait
         def observed_command(text,*args,**kwargs):
             if '/chunk forceload ' in text:
                 counts['loading']+=1
-                self.assertEqual(output.getvalue().count('Loading export area:'),counts['loading'])
+                self.assertEqual(sum(s.startswith('Loading export area:') for s in activities),counts['loading'])
+                self.assertEqual(output.getvalue().count('Exporting primary selection (with chunk loading and teleport) ...'),counts['loading'])
             if '/we export ' in text:
                 counts['exporting']+=1
-                self.assertEqual(output.getvalue().count('Chunk load checks passed; selecting and exporting primary selection.'),counts['exporting'])
+                self.assertEqual(activities.count('Chunk load checks passed; selecting and exporting primary selection.'),counts['exporting'])
             return command(text,*args,**kwargs)
         def observed_wait(path,issued):
             counts['waiting']+=1
-            self.assertEqual(output.getvalue().count('Export acknowledged; waiting for a fresh file to stop changing.'),counts['waiting'])
+            self.assertEqual(sum(s.startswith('Waiting for fresh stable export:') for s in activities),counts['waiting'])
             return wait(path,issued)
         console.command=observed_command; run.wait=observed_wait
         with patch('sys.stdout',new=output):
@@ -127,29 +129,93 @@ class RunTests(unittest.TestCase):
         self.assertNotIn('for reuse',text)
         self.assertNotIn('revalidating saved primary',text)
         self.assertIn('Selection 1/2: X 0..4, Y 65..67, Z 0..4 (5×3×5 blocks); includes 3-block overlap.',text)
-        self.assertIn('no additional deeper probes needed',text)
+        self.assertNotIn('Attempt 1/3',text)
+        self.assertNotIn('attempt 1/3',text)
+        self.assertNotIn('Retrying whole selection',text)
+        self.assertNotIn('captured: primary export and',text)
         self.assertLess(text.index('Selection 1/2 captured:'),text.index('Selection 2/2:'))
-        self.assertIn('checkpoint saved',text)
-        self.assertIn('Neighbor overlaps: 1 match',text)
+        self.assertIn('saved (',text)
+        self.assertNotIn('Shared block records agree',text)
+        self.assertNotIn('recording its hash',text)
+        self.assertTrue(any(s.startswith('Hashing export:') for s in activities))
         self.assertLess(text.index('Final audit: rechecking'),text.index('Auditing run selection 1/2'))
 
     def test_deeper_probe_plan_and_confirmation_progress_are_visible(self):
         run=self.create(); run.console=FakeConsole(self.exports,shafts={(0,0)})
+        run.verbose=True
+        activities=[]; run.activity=lambda description,unit=None:activities.append(description)
         output=io.StringIO(); check=run.check_probe; observed=[]
         def observed_check(unit,selected,data,probe,pending):
             if not observed:
-                self.assertIn('will load and export 1 deeper probe at Y=0..67',output.getvalue())
-                self.assertIn('Deeper probe 1/1: X 0..31, Y 0..67, Z 0..31',output.getvalue())
-                self.assertIn('Validating deeper probe 1/1 and comparing',output.getvalue())
-                self.assertNotIn('Deeper probe 1/1 confirmed',output.getvalue())
+                self.assertIn('Primary export: deeper confirmation needed for 1 column; 1 probe at Y=0..67',output.getvalue())
+                self.assertTrue(any(s.startswith('Deeper probe 1/1: X 0..31, Y 0..67, Z 0..31') for s in activities))
+                self.assertTrue(any(s.startswith('Validating deeper probe 1/1 and comparing') for s in activities))
+                self.assertNotIn('Probe 1/1:',output.getvalue())
             observed.append(probe['file'])
             return check(unit,selected,data,probe,pending)
         with patch.object(run,'check_probe',side_effect=observed_check), patch('sys.stdout',new=output):
             self.assertEqual(run.collect(),0)
         text=output.getvalue()
-        self.assertIn('Deeper probe 1/1 confirmed 1 column; 0 still need confirmation. Checkpoint saved.',text)
-        self.assertIn('Selection 1/2 captured: primary export and 1 deeper probe validated',text)
+        self.assertIn('Probe 1/1: 1 column confirmed, 0 remain.',text)
+        self.assertIn('Selection 1/2 captured: primary export and 1 deeper probe validated; checkpoint saved',text)
         self.assertTrue(observed)
+
+    def test_verbose_capture_is_concise_and_rechecking_keeps_user_wording(self):
+        run=self.create(); run.console=FakeConsole(self.exports,shafts={(0,0)}); run.verbose=True
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        first=text[text.index('Selection 1/2:'):text.index('Selection 2/2:')]
+        self.assertEqual(len(first.strip().splitlines()),5)
+        self.assertEqual(first.count('X 0..4, Y 65..67, Z 0..4'),1)
+        self.assertEqual(first.count('Primary export:'),1)
+        self.assertEqual(first.count('Probe 1/1:'),1)
+        self.assertNotIn('Shared block records agree',first)
+        self.assertNotIn('attempt 1/3',first.lower())
+        for redundant in ('Nonoverlapping core:','Export file:','File stable;',
+                          'Export acknowledged;','Validating deeper probe','Checking the complete selection'):
+            self.assertNotIn(redundant,first)
+        self.assertIn('Exporting primary selection (with chunk loading and teleport) ...',first)
+        self.assertIn('Shared block records agree with the neighboring export.',text)
+        restored=runmod.Run.resume(run.directory); restored.verbose=True
+        restored.console=FakeConsole(self.exports)
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(restored.collect(),0)
+        self.assertIn('    Checking saved export: ',output.getvalue())
+        self.assertFalse(restored.console.commands)
+
+    def test_three_probes_produce_one_line_each_and_no_empty_overlap_summary(self):
+        self.plan=plan_for([dict(xmin=0,xmax=65,ymin=65,ymax=67,zmin=0,zmax=1)])
+        run=self.create(); run.verbose=True
+        run.console=FakeConsole(self.exports,shafts={(0,0),(32,0),(64,0)})
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        section=text[text.index('Selection 1/1:'):text.index('Final audit:')]
+        lines=section.strip().splitlines()
+        self.assertEqual(len(lines),7)
+        self.assertEqual(sum(line.strip().startswith('Probe ') for line in lines),3)
+        self.assertEqual(section.count('Primary export:'),1)
+        self.assertNotIn('Shared block records agree',section)
+        self.assertIn('primary export and 3 deeper probes validated; checkpoint saved',section)
+        self.assertNotIn('attempt 1/3',section.lower())
+
+    def test_verbose_overlap_summary_explains_agreement_and_missing_neighbors(self):
+        self.plan=plan_for([dict(xmin=x,xmax=x+1,ymin=65,ymax=67,zmin=0,zmax=1)
+                            for x in (0,2,4)])
+        run=self.create(); run.verbose=True; run.console=FakeConsole(self.exports)
+        output=io.StringIO()
+        with patch('sys.stdout',new=output):
+            self.assertEqual(run.collect(),0)
+        text=output.getvalue()
+        first=text[text.index('Selection 1/3:'):text.index('Selection 2/3:')]
+        self.assertNotIn('Shared block records agree',first)
+        self.assertIn('Shared block records agree with 1 neighboring export; remaining checks need 1 neighboring capture.',text)
+        self.assertIn('Shared block records agree with all 2 neighboring exports.',text)
+        self.assertEqual(text.count('Shared block records agree'),2)
 
     def test_reused_exports_are_announced_and_do_not_send_new_commands(self):
         run=self.create(); self.assertEqual(self.collect(run),0)
@@ -175,8 +241,8 @@ class RunTests(unittest.TestCase):
         text=output.getvalue()
         self.assertIn('Attempt 1/3 failed:',text)
         self.assertIn('The whole selection remains incomplete.',text)
-        self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Starting primary export attempt 2/3.'))
-        self.assertLess(text.index('Starting primary export attempt 2/3.'),text.index('Selection 1/2 captured:'))
+        self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Retrying whole selection (attempt 2/3)'))
+        self.assertLess(text.index('Retrying whole selection (attempt 2/3)'),text.index('Selection 1/2 captured:'))
 
     def test_partial_run_resumes_completed_selection_without_recapturing_it(self):
         run=self.create(); run.console=FakeConsole(self.exports)

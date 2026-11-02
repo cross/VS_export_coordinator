@@ -488,13 +488,11 @@ class Run:
         path=self.export_dir/(name+'.json')
         if os.path.lexists(path):
             raise CaptureError('Refusing an existing export filename: '+str(path))
-        self.announce('Loading export area: force-load chunks, teleport player, and wait for chunk queues.',unit)
+        self.activity('Loading export area: force-load chunks, teleport player, and wait for chunk queues.',unit)
         loaded=self.load_area(bounds)
         player=self.state['source']['player']
         purpose_label='primary selection' if purpose=='section' else 'deeper probe'
-        self.announce(f'Chunk load checks passed; selecting and exporting {purpose_label}.',unit)
-        if self.verbose:
-            print('    Export file: '+str(path),flush=True)
+        self.activity(f'Chunk load checks passed; selecting and exporting {purpose_label}.',unit)
         self.console.command(f"/executeas {player} /we select {bounds['xmin']} {bounds['ymin']} {bounds['zmin']} {bounds['xmax']} {bounds['ymax']} {bounds['zmax']}",r'Start and end position marked')
         if os.path.lexists(path):
             raise CaptureError('Export name appeared before its command: '+str(path))
@@ -505,14 +503,12 @@ class Run:
         record.setdefault('issued_exports',[]).append(ref)
         self.save()
         self.console.command(f'/executeas {player} /we export {name}',r'\d+ blocks.*exported',120)
-        self.announce('Export acknowledged; waiting for a fresh file to stop changing.',unit)
         self.activity('Waiting for fresh stable export: '+name,unit)
         self.wait(path,issued)
         info=path.lstat()
         if (not stat.S_ISREG(info.st_mode) or path.is_symlink()
                 or info.st_mtime_ns < issued or info.st_ctime_ns < issued):
             raise CaptureError('Export freshness check failed: '+path.name)
-        self.announce('File stable; recording its hash.',unit)
         self.activity('Hashing export: '+name,unit)
         ref.update(sha256=digest_file(path),size=info.st_size,mtime_ns=info.st_mtime_ns,ctime_ns=info.st_ctime_ns)
         self.save()
@@ -616,13 +612,17 @@ class Run:
                 selected=candidate['selected']; probes=list(candidate['probes'])
                 self.announce(f'Rechecking interrupted attempt: saved primary export and {len(probes)} saved deeper probes.',unit)
             else:
-                self.announce(f"Starting primary export attempt {len(record['attempts'])}/{attempt_limit}.",unit)
+                if len(record['attempts'])>1:
+                    self.announce(f"Retrying whole selection (attempt {len(record['attempts'])}/{attempt_limit}): "
+                                  'reload chunks, teleport, and export.',unit)
+                else:
+                    self.announce('Exporting primary selection (with chunk loading and teleport) ...',unit)
                 selected=self.capture(unit,unit['capture'],'section',attempt)
                 probes=[]
             if (selected['requested']!=unit['capture'] or selected['purpose']!='section'
                     or selected['unit']!=unit['id'] or selected['attempt']!=attempt):
                 raise CaptureError('Partial primary candidate does not match the active section attempt')
-            self.announce(f'Validating primary export and checking column evidence through Y={self.anchor(unit)}.',unit)
+            self.activity(f'Validating primary export and checking column evidence through Y={self.anchor(unit)}.',unit)
             data,evidence=self.read_ref(selected)
             if not data.get('Indices') and len(record['attempts'])==1:
                 raise CaptureError('Zero-block export; retry the entire loaded selection')
@@ -631,7 +631,7 @@ class Run:
             missing=columns_needing_confirmation(data,unit['capture'],self.anchor(unit))
             pending=set(missing)
             if probes:
-                self.announce(f'Revalidating {len(probes)} saved deeper probes before planning any additional exports.',unit)
+                self.activity(f'Revalidating {len(probes)} saved deeper probes before planning any additional exports.',unit)
             for probe in probes:
                 pending-=self.check_probe(unit,selected,data,probe,pending)
             if pending:
@@ -642,13 +642,14 @@ class Run:
                 if self.state['settings']['probe_ymin']>=unit['capture']['ymin']:
                     raise CaptureError('Probe Y minimum must be below the selection floor')
                 planned=list(chunk_bounds(boxes,self.state['settings']['probe_ymin'],unit['capture']['ymax']))
-                self.announce(f"Required evidence through Y={self.anchor(unit)} is missing for {count_label(len(pending),'column')}; "
-                              f"will load and export {count_label(len(planned),'deeper probe')} at "
+                self.announce(f"Primary export: deeper confirmation needed for {count_label(len(pending),'column')}; "
+                              f"{count_label(len(planned),'probe')} at "
                               f"Y={self.state['settings']['probe_ymin']}..{unit['capture']['ymax']}.",unit)
+                last_probe_notice=time.monotonic()
                 for index,bounds in enumerate(planned,1):
-                    self.announce(f'Deeper probe {index}/{len(planned)}: {bounds_label(bounds)}.',unit)
+                    self.activity(f'Deeper probe {index}/{len(planned)}: {bounds_label(bounds)}.',unit)
                     ref=self.capture(unit,bounds,'depth',attempt)
-                    self.announce(f'Validating deeper probe {index}/{len(planned)} and comparing '
+                    self.activity(f'Validating deeper probe {index}/{len(planned)} and comparing '
                                   f"Y={unit['capture']['ymin']}..{unit['capture']['ymax']} with the primary export.",unit)
                     confirmed=self.check_probe(unit,selected,data,ref,pending)
                     pending-=confirmed
@@ -656,11 +657,12 @@ class Run:
                     record['candidate']['probes']=probes
                     record['candidate']['unverified_columns']=len(pending)
                     self.save()
-                    self.announce(f"Deeper probe {index}/{len(planned)} confirmed {count_label(len(confirmed),'column')}; "
-                                  f'{len(pending)} still need confirmation. Checkpoint saved.',unit)
-            else:
-                self.announce('Column evidence is sufficient; no additional deeper probes needed.',unit)
-            self.announce('Checking the complete selection and its probes, then building overlap comparisons.',unit)
+                    now=time.monotonic()
+                    if self.verbose or now-last_probe_notice>=15:
+                        self.announce(f"Probe {index}/{len(planned)}: {count_label(len(confirmed),'column')} confirmed, "
+                                      f'{len(pending)} remain.',unit)
+                        last_probe_notice=now
+            self.activity('Checking the complete selection and its probes, then building overlap comparisons.',unit)
             data,evidence,coverage=self.check_section(unit,selected,probes)
             strips=section_fingerprints(data,unit['capture'],self.incident[unit['id']])
             record.update(status='complete',selected=selected,probes=probes,coverage=coverage,fingerprints=strips)
@@ -670,8 +672,10 @@ class Run:
             if self.state.get('recovery',{}).get('unit')==unit['id']:
                 self.state['recovery']['status']='capture_validated'
             self.save()
-            self.announce(f"Selection {unit['index']}/{len(self.units)} captured: primary export and {count_label(len(probes),'deeper probe')} validated; "
-                          f'checkpoint saved ({time.monotonic()-started:.1f}s).',unit)
+            summary=(f"primary export and {count_label(len(probes),'deeper probe')} validated; checkpoint saved"
+                     if self.verbose else 'validated and saved')
+            self.announce(f"Selection {unit['index']}/{len(self.units)} captured: {summary} "
+                          f'({time.monotonic()-started:.1f}s).',unit)
             return True
         except CompatibilityError as exc:
             record.update(status='incomplete',error=str(exc),selected=None)
@@ -793,10 +797,11 @@ class Run:
             print(f'Continuing capture: {saved} saved selections to revalidate, {interrupted} interrupted attempts to check, '
                   f'{len(self.units)-saved-interrupted} selections awaiting capture.',flush=True)
             print('Plan: revalidate saved evidence; capture only unfinished or invalid selections, '
-                  'confirm missing column evidence with loaded deeper probes, compare overlaps, then run the final audit.',flush=True)
+                  'force-loading chunks and teleporting before each export; confirm missing column evidence with deeper probes, '
+                  'compare overlaps, then run the final audit.',flush=True)
         else:
             print(f'Starting capture of {len(self.units)} selections; no saved exports to revalidate.',flush=True)
-            print('Plan: load each area, export and validate it, use deeper probes where column evidence is missing, '
+            print('Plan: force-load chunks and teleport before each export; validate it, use deeper probes where column evidence is missing, '
                   'compare neighboring overlaps, then run the final audit.',flush=True)
         while True:
             while queue:
@@ -807,7 +812,7 @@ class Run:
                     self.announce(f"Selection {unit['index']}/{len(self.units)}: revalidating saved primary export and "
                                   f"{len(record.get('probes',[]))} deeper probes before reuse.",unit)
                     if self.verbose:
-                        print('    Saved export: '+record['selected']['file'],flush=True)
+                        print('    Checking saved export: '+record['selected']['file'],flush=True)
                     try:
                         self.check_section(unit,record['selected'],record.get('probes',[]))
                         self.announce(f"Selection {unit['index']}/{len(self.units)} reused: saved exports validated; "
@@ -821,8 +826,6 @@ class Run:
                 print(f"Selection {unit['index']}/{len(self.units)}: {bounds_label(unit['capture'])}; "
                       f"includes {self.state['settings']['overlap']}-block overlap.",flush=True)
                 self.activity('Preparing primary capture',unit)
-                if self.verbose:
-                    print('  Nonoverlapping core: '+bounds_label(unit['core']),flush=True)
                 if confirm:
                     if input('Return to capture; q to stop: ').strip().lower()=='q':
                         return 130
@@ -838,13 +841,19 @@ class Run:
                 if not captured:
                     queue.appendleft(name)
                     continue
-                self.announce('Comparing overlap strips with available neighboring exports.',unit)
+                self.activity('Comparing overlap strips with available neighboring exports.',unit)
                 neighbors=[pair for pair in self.seams() if name in (pair['left'],pair['right'])]
                 conflicts=[pair for pair in neighbors if pair['status']=='mismatch']
                 matches=sum(pair['status']=='match' for pair in neighbors)
                 pending=sum(pair['status']=='pending' for pair in neighbors)
-                self.announce(f'Neighbor overlaps: {matches} match, {pending} awaiting neighboring captures, '
-                              f'{len(conflicts)} mismatch.',unit)
+                if self.verbose and matches and not conflicts:
+                    if pending:
+                        self.announce(f"Shared block records agree with {count_label(matches,'neighboring export')}; "
+                                      f"remaining checks need {count_label(pending,'neighboring capture')}.",unit)
+                    else:
+                        neighboring=('the neighboring export' if matches==1 else
+                                     f"all {count_label(matches,'neighboring export')}")
+                        self.announce(f'Shared block records agree with {neighboring}.',unit)
                 for pair in conflicts:
                     other=pair['right'] if pair['left']==name else pair['left']
                     self.announce(f"Overlap mismatch {pair['id']}; recording the differences, then requesting "

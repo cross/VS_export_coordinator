@@ -346,7 +346,7 @@ Examples:
 
     interaction=parser.add_argument_group('collection output and interaction')
     interaction.add_argument('--verbose',action='store_true',
-        help='include export filenames, original core bounds, and every final-audit selection in progress output (default: off); normal output already describes capture stages and results')
+        help='show each completed deeper probe, export/probe counts in results, successful comparisons of shared blocks with neighbors, saved-export filenames, and every final-audit selection (default: off); normal output samples long probe runs; detailed stages remain available through the status signal')
     interaction.add_argument('--step-by-step',action='store_true',
         help='prompt before each primary selection needing capture/retry; loading and deeper probes remain automatic; unused for preview/preparation/reporting (default: off)')
     interaction.add_argument('--recovery-timeout',type=int,default=DEFAULT_RECOVERY_TIMEOUT,metavar='SECONDS',
