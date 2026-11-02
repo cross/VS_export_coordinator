@@ -134,7 +134,7 @@ class RunTests(unittest.TestCase):
         self.assertIn('Selection 1/2: X 0..4, Y 65..67, Z 0..4 (5×3×5 blocks); includes 3-block overlap.',text)
         self.assertNotIn('Attempt 1/3',text)
         self.assertNotIn('attempt 1/3',text)
-        self.assertNotIn('Retrying whole selection',text)
+        self.assertNotIn('Retrying selection',text)
         self.assertNotIn('captured: primary export and',text)
         self.assertRegex(text,r'Primary export \(chunk load, teleport\) \.\.\. validated \(\d+\.\d+s\)\.\nSelection 2/2:')
         self.assertNotIn('Selection 1/2 captured:',text)
@@ -247,8 +247,24 @@ class RunTests(unittest.TestCase):
         text=output.getvalue()
         self.assertIn('Attempt 1/3 failed:',text)
         self.assertIn('The whole selection remains incomplete.',text)
-        self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Retrying whole selection (attempt 2/3)'))
-        self.assertLess(text.index('Retrying whole selection (attempt 2/3)'),text.index('... validated ('))
+        self.assertLess(text.index('Attempt 1/3 failed:'),text.index('Retrying selection 1/2 (attempt 2/3):'))
+        self.assertLess(text.index('Retrying selection 1/2 (attempt 2/3):'),text.index('... validated ('))
+        self.assertIn('\nRetrying selection 1/2 (attempt 2/3):\n  Primary export (chunk load, teleport) ... validated (',text)
+        self.assertEqual(text.count('Selection 1/2: X '),1)
+        self.assertNotIn('Retrying whole selection',text)
+        self.assertNotIn('reload chunks, teleport, and export.',text)
+
+    def test_retry_headers_show_later_attempts_without_claiming_an_exhausted_attempt(self):
+        run=self.create(); run.console=FakeConsole(self.exports)
+        run.recovery_handler=lambda *args:'quit'
+        output=io.StringIO()
+        with patch('sys.stdout',new=output), patch.object(run.console,'command',side_effect=RuntimeError('server unavailable')):
+            self.assertEqual(run.collect(),1)
+        text=output.getvalue()
+        self.assertIn('\nRetrying selection 1/2 (attempt 2/3):\n  Primary export',text)
+        self.assertIn('\nRetrying selection 1/2 (attempt 3/3):\n  Primary export',text)
+        self.assertNotIn('attempt 4/3',text)
+        self.assertEqual(text.count('Selection 1/2: X '),1)
 
     def test_primary_failure_finishes_its_line_before_the_failure_details(self):
         run=self.create(); run.console=FakeConsole(self.exports)

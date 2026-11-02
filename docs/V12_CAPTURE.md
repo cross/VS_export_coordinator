@@ -382,8 +382,10 @@ flushed immediately. This lists the loading actions in command order. Its result
 finishes the same line: `validated (3.7s).` after validation and checkpointing,
 or `complete; deeper scan needed for 102 columns; 2 probes.` before probing.
 A primary export that needs no probes has no additional completion summary.
-Attempt numbers and
-reload details appear only when another attempt becomes necessary. There
+On later attempts, `Retrying selection 149/160 (attempt 2/3):` replaces the
+initial selection/bounds header. Bounds are not repeated, and the primary-export
+line follows directly without a separate reload/retry explanation. Attempt
+numbers appear only when another attempt becomes necessary. There
 are no separate success messages for chunk queues, file stability, hashing,
 each validation phase, original core bounds, or newly generated export paths.
 Those detailed phases still update the immediate status signal; filenames and

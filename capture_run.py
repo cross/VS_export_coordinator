@@ -663,9 +663,6 @@ class Run:
                 selected=candidate['selected']; probes=list(candidate['probes'])
                 self.announce(f'Rechecking interrupted attempt: saved primary export and {len(probes)} saved deeper probes.',unit)
             else:
-                if len(record['attempts'])>1:
-                    self.announce(f"Retrying whole selection (attempt {len(record['attempts'])}/{attempt_limit}): "
-                                  'reload chunks, teleport, and export.',unit)
                 self.announce('Primary export (chunk load, teleport) ... ',unit,end='')
                 selected=self.capture(unit,unit['capture'],'section',attempt)
                 probes=[]
@@ -1019,8 +1016,14 @@ class Run:
                     except (CaptureError,OSError,ValueError) as exc:
                         print(f"Cannot reuse {name}: {exc}. Keeping its old attempt and recapturing the whole selection.",flush=True)
                         record.update(selected=None,status='incomplete')
-                print(f"Selection {unit['index']}/{len(self.units)}: {bounds_label(unit['capture'])}; "
-                      f"includes {self.state['settings']['overlap']}-block overlap.",flush=True)
+                attempts=len(record.get('attempts',[]))
+                if attempts and not record.get('candidate'):
+                    limit=self.section_attempt_limit(record)
+                    if attempts<limit:
+                        print(f"Retrying selection {unit['index']}/{len(self.units)} (attempt {attempts+1}/{limit}):",flush=True)
+                else:
+                    print(f"Selection {unit['index']}/{len(self.units)}: {bounds_label(unit['capture'])}; "
+                          f"includes {self.state['settings']['overlap']}-block overlap.",flush=True)
                 self.activity('Preparing primary capture',unit)
                 if confirm:
                     if input('Return to capture; q to stop: ').strip().lower()=='q':
