@@ -396,9 +396,12 @@ class Run:
 
     @classmethod
     def create(cls, plan, plan_path, export_dir, server_log, player, directory=None,
-               overlap=DEFAULT_OVERLAP, coverage_y=DEFAULT_COVERAGE_Y,
-               max_attempts=DEFAULT_MAX_ATTEMPTS, probe_ymin=DEFAULT_PROBE_YMIN, **kwargs):
+               overlap=DEFAULT_OVERLAP, coverage_y=None,
+               max_attempts=DEFAULT_MAX_ATTEMPTS, probe_ymin=None, **kwargs):
         p.verify_plan(plan)
+        policy=plan.get('validation',{})
+        coverage_y=policy.get('coverage_y',DEFAULT_COVERAGE_Y) if coverage_y is None else coverage_y
+        probe_ymin=policy.get('probe_ymin',DEFAULT_PROBE_YMIN) if probe_ymin is None else probe_ymin
         if type(max_attempts) is not int or max_attempts < 1:
             raise CaptureError('Maximum attempts must be positive')
         if any(type(value) is not int or value < 0 for value in (coverage_y, probe_ymin)):
@@ -408,7 +411,7 @@ class Run:
         if os.path.lexists(directory) and not is_empty_directory(directory):
             raise CaptureError('Run directory already exists and is not empty; choose an empty/new directory or use --resume: '+str(directory))
         units=run_units(plan,overlap)
-        state={'schema':SCHEMA,'operational_model':OPERATIONAL_MODEL,'run_id':run_id,'prefix':'v12_capture_'+run_id,
+        state={'schema':SCHEMA,'operational_model':OPERATIONAL_MODEL,'run_id':run_id,'prefix':p.capture_prefix(plan)+run_id,
                'plan_hash':plan['plan_hash'],'geometry_hash':plan['geometry_hash'],
                'plan_source':str(Path(plan_path).resolve()),'created_utc':datetime.now(timezone.utc).isoformat(),
                'source':{'export_dir':str(Path(export_dir).resolve()),'server_log':str(Path(server_log).resolve()),'player':player},
@@ -495,7 +498,7 @@ class Run:
         display={**self.plan,'cuboids':[{**unit['capture'],'name':unit['id']} for unit in self.state['units']]}
         path=self.directory/(self.state['run_id']+'-preview.svg')
         p.render_preview(display,path)
-        text=path.read_text().replace('v12 capture footprint and export mosaic',
+        text=path.read_text().replace(p.preview_title(self.plan),
             'Capture run '+self.state['run_id']+' (overlapping raw selections)')
         path.write_text(text)
 

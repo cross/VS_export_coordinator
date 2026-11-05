@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # vim:et sts=4 sw=4
-"""Capture a saved coastline plan in an isolated, resumable WorldEdit run.
+"""Capture a saved region or coastline plan in an isolated, resumable WorldEdit run.
 
 New runs preload selections, write uniquely named immutable raw exports, retry
 whole sections, and compare overlapping block-code multisets. Compatible runs
@@ -366,11 +366,11 @@ Examples:
     policy.add_argument('--overlap',type=int,metavar='BLOCKS',
         help=f'east/south padding for neighboring export comparisons, 1..16 (new-run default: {capture_run.DEFAULT_OVERLAP}); may subdivide cores to obey selection limits')
     policy.add_argument('--coverage-y',type=int,metavar='Y',
-        help=f"required surface/column confirmation height, nonnegative and clamped to each selection's Y range (new-run default: {capture_run.DEFAULT_COVERAGE_Y}); does not change exported Y bounds")
+        help=f"required surface/column confirmation height, nonnegative and clamped to each selection's Y range (new-run default: {capture_run.DEFAULT_COVERAGE_Y} unless supplied by the plan's validation policy); explicit value overrides the plan; does not change exported Y bounds")
     policy.add_argument('--max-attempts',type=int,metavar='N',
         help=f'automatic whole-section attempt ceiling per selection, including previous attempts, N >= 1 (new-run default: {capture_run.DEFAULT_MAX_ATTEMPTS}); continuing runs may only raise it; recovery prompt can authorize one additional attempt')
     policy.add_argument('--rescan-y-min',type=int,metavar='Y',
-        help=f'nonnegative floor for automatic deeper confirmation probes (new-run default: {capture_run.DEFAULT_PROBE_YMIN}); when needed, probes must start below the selection floor and fit selection limits')
+        help=f"nonnegative floor for automatic deeper confirmation probes (new-run default: {capture_run.DEFAULT_PROBE_YMIN} unless supplied by the plan's validation policy); explicit value overrides the plan; when needed, probes must start below the selection floor and fit selection limits")
 
     interaction=parser.add_argument_group('collection output and interaction')
     interaction.add_argument('--verbose',action='store_true',
@@ -442,9 +442,9 @@ def _main(status_reporter: RunStatus) -> int:
                 run=capture_run.Run.create(plan,plan_path,export_dir,server_log,player,
                     directory=args.run_dir.expanduser().resolve() if args.run_dir else None,
                     overlap=capture_run.DEFAULT_OVERLAP if args.overlap is None else args.overlap,
-                    coverage_y=capture_run.DEFAULT_COVERAGE_Y if args.coverage_y is None else args.coverage_y,
+                    coverage_y=args.coverage_y,
                     max_attempts=capture_run.DEFAULT_MAX_ATTEMPTS if args.max_attempts is None else args.max_attempts,
-                    probe_ymin=capture_run.DEFAULT_PROBE_YMIN if args.rescan_y_min is None else args.rescan_y_min)
+                    probe_ymin=args.rescan_y_min)
         if resuming:
             for key,value in (('overlap',args.overlap),('coverage_y',args.coverage_y),('probe_ymin',args.rescan_y_min)):
                 if value is not None and value!=run.state['settings'][key]:

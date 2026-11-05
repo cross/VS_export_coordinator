@@ -571,7 +571,7 @@ changing the maintained plan:
 
 ```sh
 plan_draft_dir=$(mktemp -d)
-python3 v12_capture_plan.py create \
+python3 v12_capture_plan.py coastline \
   --geometry capture-plans/coastal-connection/coastline_route_v12.py \
   --ymin 65 --ymax 180 \
   --x-span 450 --z-span 50 \
@@ -592,13 +592,13 @@ cmp "$plan_draft_dir/plan.json" capture-plans/coastal-connection/plan.json
 
 | Desired change | Inputs and command |
 | --- | --- |
-| Change the requested height for the entire footprint | `create --ymin MIN --ymax MAX` |
-| Use smaller or larger initial sections | `create --x-span WIDTH --z-span DEPTH` |
-| Change the shoreline shape within the existing v12 area | Edit a geometry-file copy and use `create --geometry FILE` |
+| Change the requested height for the entire footprint | `coastline --ymin MIN --ymax MAX` |
+| Use smaller or larger initial sections | `coastline --x-span WIDTH --z-span DEPTH` |
+| Change the shoreline shape within the existing v12 area | Edit a geometry-file copy and use `coastline --geometry FILE` |
 | Add height over selected regions in a revised plan | `extend --plan FILE --regions REGIONS.json` |
-| Include whole intersecting freshwater bodies | `create --freshwater BODIES.json`, or `extend --plan FILE --freshwater BODIES.json` |
+| Include whole intersecting freshwater bodies | `coastline --freshwater BODIES.json`, or `extend --plan FILE --freshwater BODIES.json` |
 
-Every `create` command also requires `--ymin` and `--ymax`. Use `--output` to
+Every `coastline` command also requires `--ymin` and `--ymax`. Use `--output` to
 write a draft. `--x-span` defaults to 450 and `--z-span` to 50; these are maximum
 sizes, so edge sections can be smaller. Both must be integers from 1 to 1023,
 and the generator also enforces the selection-volume limit. Y bounds are
@@ -608,7 +608,7 @@ For example, generate smaller sections without changing the requested height:
 
 ```sh
 plan_draft_dir=$(mktemp -d)
-python3 v12_capture_plan.py create \
+python3 v12_capture_plan.py coastline \
   --ymin 65 --ymax 180 \
   --x-span 256 --z-span 25 \
   --output "$plan_draft_dir/plan.json"
@@ -660,18 +660,18 @@ west/east capture boundaries. Regenerate after editing:
 
 ```sh
 plan_draft_dir=$(mktemp -d)
-python3 v12_capture_plan.py create \
+python3 v12_capture_plan.py coastline \
   --geometry "$geometry_draft_dir/coastline.py" \
   --ymin 65 --ymax 180 \
   --x-span 450 --z-span 50 \
   --output "$plan_draft_dir/plan.json"
 ```
 
-This generator is currently specific to the v12 coastal connection. The Z
+The `coastline` generator is specific to the v12 coastal connection. Its Z
 bands, mouth anchors, 100-block buffer, coordinate offset, and v12 geometry
-label are fixed in the program; they have no CLI options. `--geometry` permits
-shore-shape revisions within those constraints. Planning a completely
-different world region or changing those rules requires modifying the planner.
+label are fixed. `--geometry` permits shore-shape revisions within those
+constraints. For a different region, use the general `create` command described
+in [general region planning](REGION_PLANS.md); no coastline source is needed.
 
 ### Review and use a draft
 
@@ -736,7 +736,7 @@ automatically. Regenerate or discard an outdated PNG after changing the plan.
 
 Do not hand-edit `requests`, `cuboids`, export names, or hash fields in the
 expanded JSON. Editing it invalidates its content hash; changing the input and
-regenerating keeps geometry, coverage, and identifiers consistent. `create`
+regenerating keeps geometry, coverage, and identifiers consistent. `coastline`
 assigns a new plan identity when inputs change. `extend` adds height/lake
 coverage while preserving existing partition bounds; the revised plan requires
 a separate capture run. A plan file contains geometry, not collected terrain.
@@ -788,7 +788,7 @@ No claim is made that the supplied body is complete or freshwater: those
 attributes must come from mapping/world analysis outside this coastline planner.
 
 ```sh
-python3 v12_capture_plan.py create --ymin 65 --ymax 180 --freshwater freshwater-bodies.json --output /tmp/coastal-connection-revised.json
+python3 v12_capture_plan.py coastline --ymin 65 --ymax 180 --freshwater freshwater-bodies.json --output /tmp/coastal-connection-revised.json
 python3 v12_capture_plan.py extend --plan PLAN.json --freshwater freshwater-bodies.json --output /tmp/coastal-connection-revised.json
 ```
 

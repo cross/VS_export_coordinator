@@ -7,6 +7,10 @@ via the server console that will use that players interface to the server
 to generate commands to select and export a large region, a little bit at
 a time.
 
+For arbitrary cuboids, irregular footprints, holes, and changing height ranges,
+start at [general region planning](docs/REGION_PLANS.md). `create` generates
+general plans; `coastline` reproduces the original coastal connection.
+
 For the versioned v12 coastline capture planner, previews, execution commands,
 height extensions, freshwater supplements, and coverage auditing, see
 [docs/V12_CAPTURE.md](docs/V12_CAPTURE.md).
@@ -16,10 +20,11 @@ For user inputs and step-by-step plan generation/editing, start at
 Repository layout:
 
 - `vintage_story_export_coordinator.py`: collection commands, retries, and
-  resume using a specified coastline plan. This is the primary tool; it
+  resume using a specified region or coastline plan. This is the primary tool; it
   currently defaults to `capture-plans/coastal-connection/plan.json`
 - `v12_capture_plan.py`: planning, previews, and raw WorldEdit validation.
   Imported by `vintage_story_export_coordinator.py`
+- `capture_polygons.py`: exact integer-column rasterization for polygon inputs.
 - `capture_run.py`: isolated capture runs, fresh immutable attempts, whole-section
   retries, deeper confirmations, and overlap/coverage certification. This is
   the default collection engine.
@@ -31,6 +36,7 @@ Repository layout:
 - `capture-plans/coastal-connection/`: current plan, coastline input, and
   changelog; Git retains earlier plan revisions.
 - `docs/`: operating instructions and design information.
+- `examples/`: editable rectangular and irregular region definitions.
 - `tests/`: automated tests using simulated exports; no server is contacted.
 
 New captures use a unique run ID. Repeating the same plan command automatically

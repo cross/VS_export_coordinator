@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline v12 capture planning, previews, and raw WorldEdit validation.
+"""Offline region/coastline capture planning, previews, and export validation.
 
 All bounds are inclusive, in relative Vintage Story block coordinates. No server
 commands are issued by this module. The saved plan, not current source geometry,
@@ -18,6 +18,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from capture_polygons import polygon_rows
+
 VERSION = "v12-capture/1"
 WORLD_CENTER = 512_000
 MAX_SIDE = 1023
@@ -28,6 +30,7 @@ AXES = ("x", "y", "z")
 BOUND_KEYS = tuple(k for axis in AXES for k in (axis + "min", axis + "max"))
 HERE = Path(__file__).resolve().parent
 DEFAULT_GEOMETRY = HERE / "capture-plans" / "coastal-connection" / "coastline_route_v12.py"
+REGION_GEOMETRY_VERSION = "explicit-regions/1"
 
 
 def digest(value: Any) -> str:
@@ -302,12 +305,99 @@ def supplemental_lakes(path: Path | None, base_rows: dict, ymin: int, ymax: int)
 
 def seal_plan(payload: dict) -> dict:
     seed = digest(payload)[:12]
-    payload["prefix"] = "v12_capture_" + seed
+    payload["prefix"] = capture_prefix(payload) + seed
     for index, task in enumerate(payload["cuboids"], 1):
         task["index"] = index
         task["name"] = f"{payload['prefix']}_{index:05d}"
     payload["plan_hash"] = digest(payload)
     return payload
+
+
+def capture_prefix(plan: dict) -> str:
+    return "capture_" if plan.get("geometry_version")==REGION_GEOMETRY_VERSION else "v12_capture_"
+
+
+def shape_boxes(shape: dict) -> list[dict]:
+    """Compile one inclusive 3D shape to cuboids before union/partitioning."""
+    if not isinstance(shape,dict):
+        raise ValueError("Each region must be an object")
+    kind=shape.get("type","cuboid")
+    fields={"cuboid":set(BOUND_KEYS),"polygon":{"vertices","holes","ymin","ymax"},
+            "rows":{"rows","ymin","ymax"}}
+    if not isinstance(kind,str) or kind not in fields:
+        raise ValueError("Region type must be cuboid, polygon, or rows")
+    unknown=set(shape)-fields[kind]-{"type","name"}
+    if unknown:
+        raise ValueError("Unknown region fields: "+", ".join(sorted(unknown)))
+    missing=(fields[kind]-{"holes"})-set(shape)
+    if missing:
+        raise ValueError(f"{kind} region is missing fields: "+", ".join(sorted(missing)))
+    if "name" in shape and (not isinstance(shape["name"],str) or not shape["name"].strip()):
+        raise ValueError("Region name must be a nonempty string")
+    if kind=="cuboid":
+        bounds=box(shape)
+        if bounds["ymin"]<0:
+            raise ValueError("Region Y bounds must be nonnegative")
+        return [bounds]
+    ymin,ymax=shape["ymin"],shape["ymax"]
+    box(dict(xmin=0,xmax=0,ymin=ymin,ymax=ymax,zmin=0,zmax=0))
+    if ymin<0:
+        raise ValueError("Region Y bounds must be nonnegative")
+    if kind=="rows":
+        if not isinstance(shape["rows"],list) or not shape["rows"]:
+            raise ValueError("Rows region needs a nonempty rows list")
+        rows=defaultdict(list)
+        for row in shape["rows"]:
+            if (not isinstance(row,list) or len(row)!=3
+                    or any(type(n) is not int for n in row) or row[1]>row[2]):
+                raise ValueError("Region rows must be [integer Z, X min, X max] with min <= max")
+            rows[row[0]].append((row[1],row[2]))
+        return row_boxes(rows,ymin,ymax)
+    bounds=row_boxes(polygon_rows(shape["vertices"]),ymin,ymax)
+    holes=shape.get("holes",[])
+    if not isinstance(holes,list):
+        raise ValueError("Polygon holes must be a list of vertex rings")
+    cutouts=[b for ring in holes for b in row_boxes(polygon_rows(ring),ymin,ymax)]
+    return difference(bounds,cutouts)
+
+
+def region_spec_boxes(spec: dict) -> list[dict]:
+    if not isinstance(spec,dict) or set(spec)-{"regions","exclude"}:
+        raise ValueError("Region input must be an object with regions and optional exclude lists")
+    if not isinstance(spec.get("regions"),list) or not spec["regions"]:
+        raise ValueError("Region input needs a nonempty regions list")
+    if not isinstance(spec.get("exclude",[]),list):
+        raise ValueError("exclude must be a list of regions")
+    included=[b for shape in spec["regions"] for b in shape_boxes(shape)]
+    excluded=[b for shape in spec.get("exclude",[]) for b in shape_boxes(shape)]
+    requested=difference(included,excluded)
+    if not requested:
+        raise ValueError("Region definition contains no requested blocks after exclusions")
+    return requested
+
+
+def create_regions_plan(spec: dict, *, coverage_y: int, probe_ymin: int = 0,
+                        z_span: int = 50, x_span: int = DEFAULT_X_SPAN, mode: str = "exact") -> dict:
+    """An exact union of arbitrary 3D regions, minus optional excluded regions."""
+    if any(type(n) is not int or n<0 for n in (coverage_y,probe_ymin)):
+        raise ValueError("Validation coverage Y and probe Y minimum must be nonnegative integers")
+    if any(type(n) is not int or not 1<=n<=MAX_SIDE for n in (x_span,z_span)):
+        raise ValueError("X and Z spans must be integers between 1 and 1023")
+    if mode not in ("exact","banded"):
+        raise ValueError("Partition mode must be exact or banded")
+    requested,tasks=partition(region_spec_boxes(spec),z_span,mode,x_span)
+    geometry=json.loads(json.dumps(spec,allow_nan=False))
+    plan=seal_plan({"version":VERSION,"geometry_version":REGION_GEOMETRY_VERSION,
+        "geometry_hash":digest(geometry),"geometry":geometry,"world_center":WORLD_CENTER,
+        "coordinate_convention":"relative integer block positions; inclusive bounds; polygon boundary included, hole boundary excluded",
+        "requested_y":{"ymin":min(b["ymin"] for b in requested),"ymax":max(b["ymax"] for b in requested)},
+        "limits":{"max_side":MAX_SIDE,"max_volume":MAX_VOLUME},
+        "partition":{"mode":mode,"z_span":z_span,"x_span":x_span},
+        "raw_footprint":[box(b) for b in requested],"requests":requested,"cuboids":tasks,
+        "validation":{"coverage_y":coverage_y,"probe_ymin":probe_ymin},
+        "height_policy":"Reported shortened Y is unverified coverage; no implicit empty-air inference."})
+    verify_plan(plan)
+    return plan
 
 
 def create_plan(ymin: int, ymax: int, geometry: Path, z_span: int = 50,
@@ -347,7 +437,8 @@ def extend_plan(parent: dict, regions: list[dict], freshwater: Path | None = Non
     added = [box(b) for b in regions]
     lakes = []
     if freshwater:
-        _, buffered = footprint(parent["geometry"])
+        buffered=(rows_for_boxes(parent["requests"]) if parent.get("geometry_version")==REGION_GEOMETRY_VERSION
+                  else footprint(parent["geometry"])[1])
         extra, lakes = supplemental_lakes(freshwater, buffered, **parent["requested_y"])
         added.extend(extra)
     if not added:
@@ -361,7 +452,7 @@ def extend_plan(parent: dict, regions: list[dict], freshwater: Path | None = Non
     payload.update(parent_plan_hash=parent["plan_hash"], cuboids=tasks, requests=requests,
                    added_regions=added)
     if lakes:
-        prior = {item["id"]: item for item in parent["freshwater_bodies"]}
+        prior = {item["id"]: item for item in parent.get("freshwater_bodies",[])}
         for item in lakes:
             if item["id"] in prior and prior[item["id"]] != item:
                 raise ValueError(f"Freshwater ID {item['id']} already has a different definition; use a new ID")
@@ -389,8 +480,13 @@ def verify_plan(plan: dict) -> None:
     if plan.get("geometry_hash") != digest(plan["geometry"]):
         raise ValueError("Geometry hash mismatch")
     prefix = plan.get("prefix", "")
-    if not isinstance(prefix, str) or not prefix.startswith("v12_capture_") or not prefix.replace("_", "").isalnum():
+    if not isinstance(prefix, str) or not prefix.startswith(capture_prefix(plan)) or not prefix.replace("_", "").isalnum():
         raise ValueError("Unsafe capture prefix")
+    if "validation" in plan:
+        policy=plan["validation"]
+        if (not isinstance(policy,dict) or set(policy)!={"coverage_y","probe_ymin"}
+                or any(type(n) is not int or n<0 for n in policy.values())):
+            raise ValueError("Plan validation requires nonnegative integer coverage_y and probe_ymin")
     if not plan["requests"] or not plan["cuboids"]:
         raise ValueError("Empty capture plan")
     if not all(key in plan["partition"] for key in ("x_span", "z_span")):
@@ -548,6 +644,11 @@ def inspect_export(path: Path, requested: dict, world_center: int = WORLD_CENTER
     return result
 
 
+def preview_title(plan: dict) -> str:
+    return ("Capture footprint and export mosaic" if plan.get("geometry_version")==REGION_GEOMETRY_VERSION
+            else "v12 capture footprint and export mosaic")
+
+
 def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None,
                    gap_label: str = "audit gaps") -> None:
     requests = plan["requests"]
@@ -571,25 +672,36 @@ def render_preview(plan: dict, path: Path, gaps: list[dict] | None = None,
             paths.append(f'M{x0:.3f},{z0:.3f}H{x1:.3f}V{z1:.3f}H{x0:.3f}Z')
         return f'<path d="{" ".join(paths)}" fill="{color}" fill-opacity="{opacity}"/>'
     extra = sum(volume(b) for b in plan["cuboids"]) - sum(volume(b) for b in requests)
-    layers = [f'<rect width="{width+72:.3f}" height="{height+185:.3f}" fill="#f4f7fb"/>',
+    general=plan.get("geometry_version")==REGION_GEOMETRY_VERSION
+    canvas_width=max(width+72,900) if general else width+72
+    legend=("Blue: requested footprint · orange: cuboids · red: " if general else
+            "Blue: buffered request · dark blue: mouths/gap · orange: cuboids · red: ")
+    note=("Top view; different height bands can overlap. Hover cuboids for X/Y/Z bounds." if general else
+          "Mouth anchors are capture limits. Height supplements can overlap in this top view.")
+    ymin=min(b["ymin"] for b in requests) if general else plan["requested_y"]["ymin"]
+    ymax=max(b["ymax"] for b in requests) if general else plan["requested_y"]["ymax"]
+    layers = [f'<rect width="{canvas_width:.3f}" height="{height+185:.3f}" fill="#f4f7fb"/>',
               '<g font-family="sans-serif" fill="#15283c">',
-              '<text x="24" y="30" font-size="21">v12 capture footprint and export mosaic</text>',
+              f'<text x="24" y="30" font-size="21">{preview_title(plan)}</text>',
               f'<text x="24" y="53" font-size="12">{len(plan["cuboids"])} units · X ≤{plan["partition"]["x_span"]}, Z ≤{plan["partition"]["z_span"]} · {extra:,} extra block positions</text>',
-              f'<text x="24" y="73" font-size="12">Blue: buffered request · dark blue: mouths/gap · orange: cuboids · red: {escape(gap_label)}</text>',
-              f'<text x="24" y="93" font-size="12">X {xmin}..{xmax} → · Z {zmin}..{zmax} ↓ · requested Y {plan["requested_y"]["ymin"]}..{plan["requested_y"]["ymax"]}</text>',
+              f'<text x="24" y="73" font-size="12">{legend}{escape(gap_label)}</text>',
+              f'<text x="24" y="93" font-size="12">X {xmin}..{xmax} → · Z {zmin}..{zmax} ↓ · requested Y {ymin}..{ymax}</text>',
               f'<text x="24" y="113" font-size="11">Plan SHA256 {plan["plan_hash"]}</text>',
-              '<text x="24" y="131" font-size="11">Mouth anchors are capture limits. Height supplements can overlap in this top view.</text>',
+              f'<text x="24" y="131" font-size="11">{note}</text>',
               '<g transform="translate(36 155)">']
     layers.append(filled_union(plan["cuboids"], "#fff0cf"))
     layers.append(filled_union(requests, "#bbe1f3"))
-    layers.append(filled_union(plan["raw_footprint"], "#5ba1c8"))
+    if not general:
+        layers.append(filled_union(plan["raw_footprint"], "#5ba1c8"))
     layers.extend(rect(b, "none", "#c46a14") for b in plan["cuboids"])
     layers.append(filled_union(gaps or [], "#dc3545", .75))
     layers.append('</g></g>')
-    path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{width+72:.0f}" height="{height+185:.0f}" viewBox="0 0 {width+72:.3f} {height+185:.3f}">' + ''.join(layers) + '</svg>\n')
+    path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="{canvas_width:.0f}" height="{height+185:.0f}" viewBox="0 0 {canvas_width:.3f} {height+185:.3f}">' + ''.join(layers) + '</svg>\n')
 
 
 def write_plan(plan: dict, output: Path | None = None) -> Path:
+    if output is None and plan.get("geometry_version")==REGION_GEOMETRY_VERSION:
+        raise ValueError("General region plans require an explicit output path")
     destination = output or HERE / "capture-plans" / "coastal-connection" / "plan.json"
     if destination.exists() and read_json(destination) != plan:
         raise ValueError(f"Refusing to replace existing plan: {destination}")
@@ -612,15 +724,32 @@ def print_summary(plan: dict, path: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    create = commands.add_parser("create", help="create immutable plan and SVG before execution")
-    create.add_argument("--ymin", type=int, required=True)
-    create.add_argument("--ymax", type=int, required=True)
-    create.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY)
-    create.add_argument("--z-span", type=int, default=50)
-    create.add_argument("--x-span", type=int, default=DEFAULT_X_SPAN,
-                        help="maximum initial X width (default: 450; hard maximum: 1023)")
-    create.add_argument("--freshwater", type=Path, help="JSON bodies with complete integer row intervals")
-    create.add_argument("--output", type=Path)
+    create = commands.add_parser("create", help="create a plan for arbitrary 3D regions",
+        description="Union cuboids, extruded polygons, or sparse row footprints; subtract optional excluded regions. Bounds are inclusive relative integer block positions. No automatic coastline buffer.")
+    source=create.add_mutually_exclusive_group(required=True)
+    source.add_argument("--bounds",type=int,nargs=6,action="append",
+        metavar=("XMIN","YMIN","ZMIN","XMAX","YMAX","ZMAX"),
+        help="inclusive cuboid; repeat for a union of cuboids; mutually exclusive with --regions")
+    source.add_argument("--regions",type=Path,metavar="FILE",
+        help="JSON with regions and optional exclude lists; types: cuboid, polygon, rows; mutually exclusive with --bounds")
+    create.add_argument("--coverage-y",type=int,required=True,
+        help="REQUIRED column-evidence height saved in the plan; clamped to each selection's Y bounds; does not change requested height")
+    create.add_argument("--rescan-y-min",type=int,default=0,
+        help="floor for deeper confirmation probes, saved in the plan (default: 0); must be below the selection floor when probes are needed")
+    create.add_argument("--z-span",type=int,default=50,help="maximum initial Z size, 1..1023 (default: 50)")
+    create.add_argument("--x-span",type=int,default=DEFAULT_X_SPAN,help="maximum initial X size, 1..1023 (default: 450)")
+    create.add_argument("--mode",choices=("exact","banded"),default="exact",
+        help="exact keeps planned cores inside the requested region; banded may export extra edge/cutout blocks to reduce selection count (default: exact)")
+    create.add_argument("--output",type=Path,required=True,help="REQUIRED destination plan JSON; adjacent SVG is also written; differing existing plans are never overwritten")
+    coastline=commands.add_parser("coastline",help="generate the original v12 coastal-connection plan")
+    coastline.add_argument("--ymin", type=int, required=True,help="inclusive minimum Y (required)")
+    coastline.add_argument("--ymax", type=int, required=True,help="inclusive maximum Y (required)")
+    coastline.add_argument("--geometry", type=Path, default=DEFAULT_GEOMETRY,help="shoreline literals (default: maintained v12 coastline source beside the script)")
+    coastline.add_argument("--z-span", type=int, default=50,help="maximum initial Z size, 1..1023 (default: 50)")
+    coastline.add_argument("--x-span", type=int, default=DEFAULT_X_SPAN,
+                          help="maximum initial X width, 1..1023 (default: 450)")
+    coastline.add_argument("--freshwater", type=Path, help="JSON bodies with complete integer row intervals (default: none)")
+    coastline.add_argument("--output", type=Path,help="destination JSON (default: maintained capture-plans/coastal-connection/plan.json beside script)")
     extend = commands.add_parser("extend", help="add height/region requests in a new plan")
     extend.add_argument("--plan", type=Path, required=True)
     extend.add_argument("--regions", type=Path, help="JSON object with regions: [inclusive cuboid bounds]")
@@ -629,6 +758,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "create":
+            spec=(read_json(args.regions) if args.regions else
+                  {"regions":[dict(zip(("xmin","ymin","zmin","xmax","ymax","zmax"),values))
+                              for values in args.bounds]})
+            plan=create_regions_plan(spec,coverage_y=args.coverage_y,probe_ymin=args.rescan_y_min,
+                                     x_span=args.x_span,z_span=args.z_span,mode=args.mode)
+            path=write_plan(plan,args.output)
+            print_summary(plan,path)
+        elif args.command == "coastline":
             plan = create_plan(args.ymin, args.ymax, args.geometry, args.z_span,
                                freshwater=args.freshwater, x_span=args.x_span)
             path = write_plan(plan, args.output)
@@ -636,7 +773,7 @@ def main() -> int:
         elif args.command == "extend":
             if not args.regions and not args.freshwater:
                 raise ValueError("extend requires --regions and/or --freshwater")
-            plan = extend_plan(load_plan(args.plan), read_json(args.regions)["regions"] if args.regions else [], args.freshwater)
+            plan = extend_plan(load_plan(args.plan), region_spec_boxes(read_json(args.regions)) if args.regions else [], args.freshwater)
             path = write_plan(plan, args.output)
             print_summary(plan, path)
     except (OSError, ValueError, KeyError, TypeError, SyntaxError) as exc:
